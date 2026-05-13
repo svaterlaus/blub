@@ -5,7 +5,7 @@ use crate::{
 };
 use rand::prelude::*;
 use std::{collections::VecDeque, path::Path, rc::Rc, time::Duration};
-use wgpu_profiler::{wgpu_profiler, GpuProfiler};
+use wgpu_profiler::GpuProfiler;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -28,7 +28,7 @@ pub struct HybridFluid {
     pressure_field_from_velocity: PressureField,
     pressure_field_from_density: PressureField,
 
-    volume_linked_lists: wgpu::Texture,
+    linked_list_cells: wgpu::Buffer,
     volume_marker: wgpu::Texture,
     volume_debug: Option<wgpu::Texture>,
 
@@ -105,7 +105,7 @@ impl HybridFluid {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: max_num_particles as u64 * std::mem::size_of::<ParticlePositionLl>() as u64,
-                usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };
@@ -114,7 +114,7 @@ impl HybridFluid {
         let particles_position_llindex_tmp = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Buffer: Particles position & llindex tmp"),
             size: max_num_particles as u64 * std::mem::size_of::<ParticlePositionLl>() as u64,
-            usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let particles_velocity_x = create_particle_buffer("Buffer: Particles velocity X");
@@ -122,8 +122,19 @@ impl HybridFluid {
         let particles_velocity_z = create_particle_buffer("Buffer: Particles velocity Z");
         let particle_binning_atomic_counter = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Buffer: Atomic counter for particle binning"),
-            size: wgpu::BIND_BUFFER_ALIGNMENT,
-            usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let linked_list_cells_size = grid_dimension.width as u64
+            * grid_dimension.height as u64
+            * grid_dimension.depth_or_array_layers.max(1) as u64
+            * std::mem::size_of::<u32>() as u64;
+        let linked_list_cells = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Buffer: Fluid dual-grid u32 cells (linked lists / particle binning)"),
+            size: linked_list_cells_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -135,17 +146,16 @@ impl HybridFluid {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D3,
                 format,
-                usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[] as &[wgpu::TextureFormat],
             }
         };
         // TODO: Reuse volumes to safe memory, not all are used simultaneously.
         let volume_velocity_x = device.create_texture(&create_volume_texture_desc("Velocity Volume X", wgpu::TextureFormat::R32Float));
         let volume_velocity_y = device.create_texture(&create_volume_texture_desc("Velocity Volume Y", wgpu::TextureFormat::R32Float));
         let volume_velocity_z = device.create_texture(&create_volume_texture_desc("Velocity Volume Z", wgpu::TextureFormat::R32Float));
-        let volume_linked_lists = device.create_texture(&create_volume_texture_desc(
-            "Linked Lists / Particle Binning Volume",
-            wgpu::TextureFormat::R32Uint,
-        ));
         let volume_marker = device.create_texture(&create_volume_texture_desc("Marker Grid", wgpu::TextureFormat::R8Snorm));
         let volume_debug = if cfg!(debug_assertions) {
             Some(device.create_texture(&create_volume_texture_desc("Debug Volume", wgpu::TextureFormat::R32Float)))
@@ -157,7 +167,6 @@ impl HybridFluid {
         let volume_velocity_view_x = volume_velocity_x.create_view(&Default::default());
         let volume_velocity_view_y = volume_velocity_y.create_view(&Default::default());
         let volume_velocity_view_z = volume_velocity_z.create_view(&Default::default());
-        let volume_linked_lists_view = volume_linked_lists.create_view(&Default::default());
         let volume_marker_view = volume_marker.create_view(&Default::default());
         let volume_debug_view = match volume_debug {
             Some(ref volume) => Some(volume.create_view(&Default::default())),
@@ -182,7 +191,7 @@ impl HybridFluid {
         let group_layout_transfer_velocity = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(false)) // particles, position llindex
             .next_binding_compute(binding_glsl::buffer(true)) // particles, velocity component
-            .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R32Uint, wgpu::StorageTextureAccess::ReadWrite)) // linkedlist_volume
+            .next_binding_compute(binding_glsl::buffer(false)) // fluid dual-grid u32 cells (linked lists)
             .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R8Snorm, wgpu::StorageTextureAccess::ReadWrite)) // marker volume
             .next_binding_compute(binding_glsl::image3D(
                 wgpu::TextureFormat::R32Float,
@@ -190,10 +199,10 @@ impl HybridFluid {
             )) // velocity component
             .create(device, "BindGroupLayout: Transfer velocity from Particles to Volume(s)");
         let group_layout_divergence_compute = BindGroupLayoutBuilder::new()
-            .next_binding_compute(binding_glsl::texture3D()) // marker volume
-            .next_binding_compute(binding_glsl::texture3D()) // velocityX
-            .next_binding_compute(binding_glsl::texture3D()) // velocityY
-            .next_binding_compute(binding_glsl::texture3D()) // velocityZ
+            .next_binding_compute(binding_glsl::texture3D()) // marker volume (R8Snorm)
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityX
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityY
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityZ
             .next_binding_compute(binding_glsl::image3D(
                 wgpu::TextureFormat::R32Float,
                 wgpu::StorageTextureAccess::ReadWrite,
@@ -213,14 +222,14 @@ impl HybridFluid {
                 wgpu::TextureFormat::R32Float,
                 wgpu::StorageTextureAccess::ReadWrite,
             )) // velocityZ
-            .next_binding_compute(binding_glsl::texture3D()) // pressure
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // pressure
             .create(device, "BindGroupLayout: Write to Velocity");
         let group_layout_advect_particles = BindGroupLayoutBuilder::new()
-            .next_binding_compute(binding_glsl::texture3D()) // velocityX
-            .next_binding_compute(binding_glsl::texture3D()) // velocityY
-            .next_binding_compute(binding_glsl::texture3D()) // velocityZ
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityX
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityY
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityZ
             .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R8Snorm, wgpu::StorageTextureAccess::ReadWrite)) // marker volume
-            .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R32Uint, wgpu::StorageTextureAccess::ReadWrite)) // linkedlist_volume
+            .next_binding_compute(binding_glsl::buffer(false)) // fluid dual-grid u32 cells (linked lists)
             .next_binding_compute(binding_glsl::buffer(false)) // particles, position llindex
             .next_binding_compute(binding_glsl::buffer(false)) // particles, velocityX
             .next_binding_compute(binding_glsl::buffer(false)) // particles, velocityY
@@ -228,14 +237,14 @@ impl HybridFluid {
             .create(device, "BindGroupLayout: Advect to Particles");
 
         let group_layout_binning = BindGroupLayoutBuilder::new()
-            .next_binding_compute(binding_glsl::buffer(true)) // particles, position llindex
-            .next_binding_compute(binding_glsl::buffer(true)) // particles, position llindex
-            .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R32Uint, wgpu::StorageTextureAccess::ReadWrite)) // volume_particle_binning
+            .next_binding_compute(binding_glsl::buffer(false)) // particles, position llindex (written during count)
+            .next_binding_compute(binding_glsl::buffer(false)) // particles tmp
+            .next_binding_compute(binding_glsl::buffer(false)) // fluid dual-grid u32 cells (particle binning)
             .next_binding_compute(binding_glsl::buffer(false)) // ParticleBinningAtomicCounter
             .create(device, "BindGroupLayout: Binning");
         let group_layout_density_projection_gather_error = BindGroupLayoutBuilder::new()
-            .next_binding_compute(binding_glsl::buffer(false)) // particles, position llindex
-            .next_binding_compute(binding_glsl::utexture3D()) // linkedlist_volume
+            .next_binding_compute(binding_glsl::buffer(true)) // particles, position llindex (readonly in gather shader)
+            .next_binding_compute(binding_glsl::buffer(true)) // fluid dual-grid u32 cells (linked lists, read-only)
             .next_binding_compute(binding_glsl::image3D(wgpu::TextureFormat::R8Snorm, wgpu::StorageTextureAccess::ReadWrite)) // marker volume
             .next_binding_compute(binding_glsl::image3D(
                 wgpu::TextureFormat::R32Float,
@@ -245,9 +254,9 @@ impl HybridFluid {
         let group_layout_density_projection_correct_particles = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(false)) // particles, position llindex
             .next_binding_compute(binding_glsl::texture3D()) // marker volume
-            .next_binding_compute(binding_glsl::texture3D()) // velocityX
-            .next_binding_compute(binding_glsl::texture3D()) // velocityY
-            .next_binding_compute(binding_glsl::texture3D()) // velocityZ
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityX
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityY
+            .next_binding_compute(binding_glsl::texture3D_non_filterable()) // velocityZ
             .create(device, "BindGroupLayout: Correct density error");
 
         let solver_config = SolverConfig {
@@ -275,21 +284,21 @@ impl HybridFluid {
             BindGroupBuilder::new(&group_layout_transfer_velocity)
                 .resource(particles_position_llindex.as_entire_binding())
                 .resource(particles_velocity_x.as_entire_binding())
-                .texture(&volume_linked_lists_view)
+                .resource(linked_list_cells.as_entire_binding())
                 .texture(&volume_marker_view)
                 .texture(&volume_velocity_view_x)
                 .create(device, "BindGroup: Transfer velocity to volume X, p-buffer"),
             BindGroupBuilder::new(&group_layout_transfer_velocity)
                 .resource(particles_position_llindex.as_entire_binding())
                 .resource(particles_velocity_y.as_entire_binding())
-                .texture(&volume_linked_lists_view)
+                .resource(linked_list_cells.as_entire_binding())
                 .texture(&volume_marker_view)
                 .texture(&volume_velocity_view_y)
                 .create(device, "BindGroup: Transfer velocity to volume Y, p-buffer"),
             BindGroupBuilder::new(&group_layout_transfer_velocity)
                 .resource(particles_position_llindex.as_entire_binding())
                 .resource(particles_velocity_z.as_entire_binding())
-                .texture(&volume_linked_lists_view)
+                .resource(linked_list_cells.as_entire_binding())
                 .texture(&volume_marker_view)
                 .texture(&volume_velocity_view_z)
                 .create(device, "BindGroup: Transfer velocity to volume Z, p-buffer"),
@@ -321,7 +330,7 @@ impl HybridFluid {
             .texture(&volume_velocity_view_y)
             .texture(&volume_velocity_view_z)
             .texture(&volume_marker_view)
-            .texture(&volume_linked_lists_view)
+            .resource(linked_list_cells.as_entire_binding())
             .resource(particles_position_llindex.as_entire_binding())
             .resource(particles_velocity_x.as_entire_binding())
             .resource(particles_velocity_y.as_entire_binding())
@@ -331,13 +340,13 @@ impl HybridFluid {
         let bind_group_binning = BindGroupBuilder::new(&group_layout_binning)
             .resource(particles_position_llindex.as_entire_binding())
             .resource(particles_position_llindex_tmp.as_entire_binding())
-            .texture(&volume_linked_lists_view) // reused for binning counters
+            .resource(linked_list_cells.as_entire_binding()) // reused for binning counters
             .resource(particle_binning_atomic_counter.as_entire_binding())
             .create(device, "BindGroup: Binning");
 
         let bind_group_density_projection_gather_error = BindGroupBuilder::new(&group_layout_density_projection_gather_error)
             .resource(particles_position_llindex.as_entire_binding())
-            .texture(&volume_linked_lists_view)
+            .resource(linked_list_cells.as_entire_binding())
             .texture(&volume_marker_view)
             .texture(&pressure_solver.residual_view())
             .create(device, "BindGroup: Density projection gather 0");
@@ -368,73 +377,69 @@ impl HybridFluid {
         }
         .create(device, "BindGroup: Fluid Renderers");
 
-        // pipeline layouts.
-        // Use same push constant range for all pipelines to improve internal Vulkan pipeline compatibility.
-        let push_constant_ranges = &[wgpu::PushConstantRange {
-            stages: wgpu::ShaderStage::COMPUTE,
-            range: 0..8,
-        }];
+        // Same immediate blob size for all fluid compute pipelines (transfer + pressure path).
+        const FLUID_COMPUTE_IMMEDIATE_SIZE: u32 = 8;
 
         let layout_transfer_velocity = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Transfer Velocity"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_transfer_velocity.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_transfer_velocity.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
         let layout_divergence_compute = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Compute Divergence"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_divergence_compute.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_divergence_compute.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
         let layout_write_velocity_volume = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Write Volume"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_write_velocity_volume.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_write_velocity_volume.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
         let layout_particles = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Particles"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_advect_particles.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_advect_particles.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
 
         let layout_binning = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: Binning"),
-            bind_group_layouts: &[global_bind_group_layout, &group_layout_general.layout, &group_layout_binning.layout],
-            push_constant_ranges,
+            bind_group_layouts: &[Some(global_bind_group_layout), Some(&group_layout_general.layout), Some(&group_layout_binning.layout)],
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
 
         let layout_density_projection_gather_error = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Density Projection Gather"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_density_projection_gather_error.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_density_projection_gather_error.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
         let layout_density_projection_correct_particles = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout: HybridFluid, Density Projection Gather"),
             bind_group_layouts: &[
-                global_bind_group_layout,
-                &group_layout_general.layout,
-                &group_layout_density_projection_correct_particles.layout,
+                Some(global_bind_group_layout),
+                Some(&group_layout_general.layout),
+                Some(&group_layout_density_projection_correct_particles.layout),
             ],
-            push_constant_ranges,
+            immediate_size: FLUID_COMPUTE_IMMEDIATE_SIZE,
         }));
 
         HybridFluid {
@@ -445,7 +450,7 @@ impl HybridFluid {
             pressure_field_from_density,
 
             volume_marker,
-            volume_linked_lists,
+            linked_list_cells,
             volume_debug,
 
             particles_position_llindex,
@@ -705,14 +710,14 @@ impl HybridFluid {
                     .next_binding_vertex(binding_glsl::buffer(true)) // particles, velocityX
                     .next_binding_vertex(binding_glsl::buffer(true)) // particles, velocityY
                     .next_binding_vertex(binding_glsl::buffer(true)) // particles, velocityZ
-                    .next_binding_vertex(binding_glsl::texture3D()) // velocityX
-                    .next_binding_vertex(binding_glsl::texture3D()) // velocityY
-                    .next_binding_vertex(binding_glsl::texture3D()) // velocityZ
+                    .next_binding_vertex(binding_glsl::texture3D_non_filterable()) // velocityX
+                    .next_binding_vertex(binding_glsl::texture3D_non_filterable()) // velocityY
+                    .next_binding_vertex(binding_glsl::texture3D_non_filterable()) // velocityZ
                     .next_binding_vertex(binding_glsl::texture3D()) // marker
-                    .next_binding_vertex(binding_glsl::texture3D()) // pressure
-                    .next_binding_vertex(binding_glsl::texture3D()); // density
+                    .next_binding_vertex(binding_glsl::texture3D_non_filterable()) // pressure
+                    .next_binding_vertex(binding_glsl::texture3D_non_filterable()); // density
                 if cfg!(debug_assertions) {
-                    builder = builder.next_binding_vertex(binding_glsl::texture3D());
+                    builder = builder.next_binding_vertex(binding_glsl::texture3D_non_filterable());
                 }
 
                 builder.create(device, "BindGroupLayout: ParticleRenderer")
@@ -777,7 +782,7 @@ impl HybridFluid {
         pipeline_manager: &PipelineManager,
         profiler: &mut GpuProfiler,
     ) {
-        wgpu_profiler!("update uniforms", profiler, encoder, device, {
+        crate::wgpu_profiler!("update uniforms", profiler, encoder, device, {
             self.pressure_field_from_density.update_uniforms(queue, simulation_delta);
             self.pressure_field_from_velocity.update_uniforms(queue, simulation_delta);
             self.simulation_properties_uniformbuffer.update_content(queue, self.simulation_properties);
@@ -795,52 +800,53 @@ impl HybridFluid {
             encoder.clear_texture(&volume_debug, &Default::default());
         }
 
-        wgpu_profiler!("transfer & divergence compute", profiler, encoder, device, {
+        crate::wgpu_profiler!("transfer & divergence compute", profiler, encoder, device, {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("transfer & divergence compute"),
+                timestamp_writes: None,
             });
             cpass.set_bind_group(0, global_bind_group, &[]);
             cpass.set_bind_group(1, &self.bind_group_general, &[]);
 
-            wgpu_profiler!("transfer particle velocity to grid", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("transfer particle velocity to grid", profiler, &mut cpass, device, {
                 for i in 0..3 {
-                    wgpu_profiler!(&format!("dimension {}", ["x", "y", "z"][i]), profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!(&format!("dimension {}", ["x", "y", "z"][i]), profiler, &mut cpass, device, {
                         cpass.set_bind_group(2, &self.bind_group_transfer_velocity[i], &[]);
                         let scope_label = &format!("clear linked list grid{}", if i == 0 { " & marker" } else { "" });
-                        wgpu_profiler!(scope_label, profiler, &mut cpass, device, {
+                        crate::wgpu_profiler!(scope_label, profiler, &mut cpass, device, {
                             cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_clear));
-                            cpass.set_push_constants(0, bytemuck::bytes_of(&[i as u32]));
-                            cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                            cpass.set_immediates(0, bytemuck::bytes_of(&[i as u32]));
+                            cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                         });
 
-                        wgpu_profiler!("create particle linked lists", profiler, &mut cpass, device, {
+                        crate::wgpu_profiler!("create particle linked lists", profiler, &mut cpass, device, {
                             cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_build_linkedlist));
-                            cpass.dispatch(particle_work_groups, 1, 1);
+                            cpass.dispatch_workgroups(particle_work_groups, 1, 1);
                         });
 
                         if i == 0 {
-                            wgpu_profiler!("set boundary marker", profiler, &mut cpass, device, {
+                            crate::wgpu_profiler!("set boundary marker", profiler, &mut cpass, device, {
                                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_set_boundary_marker));
-                                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                             });
                         }
 
-                        wgpu_profiler!("gather velocity & apply global forces", profiler, &mut cpass, device, {
+                        crate::wgpu_profiler!("gather velocity & apply global forces", profiler, &mut cpass, device, {
                             cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_gather_velocity));
-                            cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                            cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                         });
                     });
                 }
             });
 
-            wgpu_profiler!("compute divergence", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("compute divergence", profiler, &mut cpass, device, {
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_divergence_compute));
                 cpass.set_bind_group(2, &self.bind_group_divergence_compute, &[]); // Writes directly into Residual of the pressure solver.
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
             });
         });
 
-        wgpu_profiler!("primary pressure solver (divergence)", profiler, encoder, device, {
+        crate::wgpu_profiler!("primary pressure solver (divergence)", profiler, encoder, device, {
             self.pressure_solver.solve(
                 simulation_delta,
                 encoder,
@@ -854,34 +860,35 @@ impl HybridFluid {
         if self.dynamic_settings.particle_rebinning_step_frequency != 0
             && self.step_counter % self.dynamic_settings.particle_rebinning_step_frequency == 0
         {
-            wgpu_profiler!("Particle Binning", profiler, encoder, device, {
-                wgpu_profiler!("Clear counters", profiler, encoder, device, {
-                    encoder.clear_texture(&self.volume_linked_lists, &Default::default());
+            crate::wgpu_profiler!("Particle Binning", profiler, encoder, device, {
+                crate::wgpu_profiler!("Clear counters", profiler, encoder, device, {
+                    encoder.clear_buffer(&self.linked_list_cells, 0, None);
                 });
 
                 {
                     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Particle Binning"),
+                        timestamp_writes: None,
                     });
                     cpass.set_bind_group(0, global_bind_group, &[]);
                     cpass.set_bind_group(1, &self.bind_group_general, &[]);
                     cpass.set_bind_group(2, &self.bind_group_binning, &[]);
-                    wgpu_profiler!("count", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("count", profiler, &mut cpass, device, {
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_binning_count));
-                        cpass.dispatch(particle_work_groups, 1, 1);
+                        cpass.dispatch_workgroups(particle_work_groups, 1, 1);
                     });
-                    wgpu_profiler!("scan", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("scan", profiler, &mut cpass, device, {
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_binning_scan));
-                        cpass.dispatch(scan_work_groups, 1, 1);
+                        cpass.dispatch_workgroups(scan_work_groups, 1, 1);
                     });
-                    wgpu_profiler!("rewrite particles", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("rewrite particles", profiler, &mut cpass, device, {
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_binning_rewrite_particles));
-                        cpass.dispatch(particle_work_groups, 1, 1);
+                        cpass.dispatch_workgroups(particle_work_groups, 1, 1);
                     });
                 }
 
                 // Copy binned particles back to avoid having all descriptors twice
-                wgpu_profiler!("Copy binned particles", profiler, encoder, device, {
+                crate::wgpu_profiler!("Copy binned particles", profiler, encoder, device, {
                     encoder.copy_buffer_to_buffer(
                         &self.particles_position_llindex_tmp,
                         0,
@@ -896,6 +903,7 @@ impl HybridFluid {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("correct for divergence / advect, compute density"),
+                timestamp_writes: None,
             });
             cpass.set_bind_group(0, global_bind_group, &[]);
             cpass.set_bind_group(1, &self.bind_group_general, &[]);
@@ -903,41 +911,41 @@ impl HybridFluid {
             {
                 cpass.set_bind_group(2, &self.bind_group_divergence_projection_write_velocity, &[]);
 
-                wgpu_profiler!("make velocity grid divergence free", profiler, &mut cpass, device, {
+                crate::wgpu_profiler!("make velocity grid divergence free", profiler, &mut cpass, device, {
                     cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_divergence_remove));
-                    cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                    cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                 });
 
-                wgpu_profiler!("extrapolate velocity grid", profiler, &mut cpass, device, {
+                crate::wgpu_profiler!("extrapolate velocity grid", profiler, &mut cpass, device, {
                     cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_extrapolate_velocity));
-                    cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                    cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                 });
             }
-            wgpu_profiler!("clear marker & linked list grids", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("clear marker & linked list grids", profiler, &mut cpass, device, {
                 cpass.set_bind_group(2, &self.bind_group_transfer_velocity[0], &[]);
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_clear));
-                cpass.set_push_constants(0, &bytemuck::bytes_of(&[0 as u32]));
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.set_immediates(0, &bytemuck::bytes_of(&[0 as u32]));
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
             });
-            wgpu_profiler!("advect particles & write new linked list grid", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("advect particles & write new linked list grid", profiler, &mut cpass, device, {
                 cpass.set_bind_group(2, &self.bind_group_advect_particles, &[]);
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_advect_particles));
-                cpass.dispatch(particle_work_groups, 1, 1);
+                cpass.dispatch_workgroups(particle_work_groups, 1, 1);
             });
 
-            wgpu_profiler!("density projection: set boundary marker", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("density projection: set boundary marker", profiler, &mut cpass, device, {
                 cpass.set_bind_group(2, &self.bind_group_transfer_velocity[0], &[]);
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_transfer_set_boundary_marker));
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
             });
-            wgpu_profiler!("density projection: compute density error via gather", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("density projection: compute density error via gather", profiler, &mut cpass, device, {
                 cpass.set_bind_group(2, &self.bind_group_density_projection_gather_error, &[]);
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_density_projection_gather_error));
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
             });
         }
 
-        wgpu_profiler!("secondary pressure solver (density)", profiler, encoder, device, {
+        crate::wgpu_profiler!("secondary pressure solver (density)", profiler, encoder, device, {
             self.pressure_solver.solve(
                 simulation_delta,
                 encoder,
@@ -951,25 +959,26 @@ impl HybridFluid {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("correct for density error"),
+                timestamp_writes: None,
             });
             cpass.set_bind_group(1, &self.bind_group_general, &[]);
             cpass.set_bind_group(0, global_bind_group, &[]);
             {
                 cpass.set_bind_group(2, &self.bind_group_density_projection_write_velocity, &[]);
 
-                wgpu_profiler!("compute position change", profiler, &mut cpass, device, {
+                crate::wgpu_profiler!("compute position change", profiler, &mut cpass, device, {
                     cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_density_projection_position_change));
-                    cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                    cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                 });
-                wgpu_profiler!("extrapolate velocity grid", profiler, &mut cpass, device, {
+                crate::wgpu_profiler!("extrapolate velocity grid", profiler, &mut cpass, device, {
                     cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_extrapolate_velocity));
-                    cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                    cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
                 });
             }
-            wgpu_profiler!("correct particle density error", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("correct particle density error", profiler, &mut cpass, device, {
                 cpass.set_bind_group(2, &self.bind_group_density_projection_correct_particles, &[]);
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_density_projection_correct_particles));
-                cpass.dispatch(particle_work_groups, 1, 1);
+                cpass.dispatch_workgroups(particle_work_groups, 1, 1);
             });
         }
 

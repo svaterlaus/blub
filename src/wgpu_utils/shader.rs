@@ -92,9 +92,13 @@ impl ShaderDirectory {
             }
         };
 
+        // Bumped when compile options affecting SPIR-V output change (invalidates stale cache entries).
+        const SHADER_CACHE_SALT: u64 = 10;
+
         // Check for cache hit.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         glsl_code.hash(&mut hasher);
+        SHADER_CACHE_SALT.hash(&mut hasher);
 
         let cache_path = self.cache_dir.join(format!(
             "{:X}.{}.cache",
@@ -105,10 +109,9 @@ impl ShaderDirectory {
         if let Ok(cached_shader) = std::fs::read(&cache_path) {
             if let Ok(sources_string) = std::fs::read_to_string(&dependent_sources_cache_path) {
                 return Ok(ShaderModuleWithSourceFiles {
-                    module: device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+                    module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                         label: Some(path.file_name().unwrap().to_str().unwrap()),
                         source: wgpu::ShaderSource::SpirV(Borrowed(bytemuck::cast_slice(&cached_shader))),
-                        flags: wgpu::ShaderFlags::empty(),
                     }),
                     source_files: sources_string.lines().map(|line| PathBuf::from(line)).collect(),
                 });
@@ -120,14 +123,15 @@ impl ShaderDirectory {
             let mut options = shaderc::CompileOptions::new().unwrap();
             //options.set_hlsl_io_mapping(true);
             options.set_warnings_as_errors();
-            options.set_target_env(shaderc::TargetEnv::Vulkan, 0);
+            options.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_2 as u32);
+            options.set_target_spirv(shaderc::SpirvVersion::V1_3);
             //if cfg!(debug_assertions) {
             //    options.set_optimization_level(shaderc::OptimizationLevel::Performance);
             //} else {
             options.set_optimization_level(shaderc::OptimizationLevel::Performance);
             //}
-            // Helps a lot when inspecting in ShaderDoc (will show all original source files before processing) but doesn't seem to hurt performance at all :)
-            options.set_generate_debug_info();
+            // Debug line info can insert OpLine in sections Naga's SPIR-V front-end rejects (see naga Error::UnsupportedInstruction(Type, Line)).
+            // options.set_generate_debug_info();
 
             options.add_macro_definition("FRAGMENT_SHADER", Some(if kind == shaderc::ShaderKind::Fragment { "1" } else { "0" }));
             options.add_macro_definition("VERTEX_SHADER", Some(if kind == shaderc::ShaderKind::Vertex { "1" } else { "0" }));
@@ -192,10 +196,9 @@ impl ShaderDirectory {
         })?;
 
         Ok(ShaderModuleWithSourceFiles {
-            module: device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(path.file_name().unwrap().to_str().unwrap()),
-                source: wgpu::ShaderSource::SpirV(Borrowed(&compilation_artifact.as_binary())),
-                flags: wgpu::ShaderFlags::empty(),
+                source: wgpu::ShaderSource::SpirV(Borrowed(compilation_artifact.as_binary())),
             }),
             source_files: source_files.into_inner(),
         })

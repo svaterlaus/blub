@@ -10,7 +10,7 @@ void main() {
 
     uint indexInCell = Old_Particles[particleIndex].LinkedListNext;
     ivec3 cellCoordinate = ivec3(Old_Particles[particleIndex].Position);
-    uint maxCellIndex = imageLoad(ParticleBinningVolume, cellCoordinate).x;
+    uint maxCellIndex = FluidDualGridCells.Cells[fluid_grid_cell_linear_index(cellCoordinate)];
 
     New_Particles[maxCellIndex - indexInCell] = Old_Particles[particleIndex];
 }

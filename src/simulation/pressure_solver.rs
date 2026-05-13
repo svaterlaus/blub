@@ -1,10 +1,15 @@
 use crate::wgpu_utils::{self, binding_builder::*, binding_glsl, pipelines::*, shader::ShaderDirectory};
-use futures::Future;
-use futures::*;
-use std::collections::VecDeque;
-use std::rc::Rc;
-use std::{path::Path, pin::Pin, time::Duration};
-use wgpu_profiler::{wgpu_profiler, GpuProfiler};
+use std::{
+    collections::VecDeque,
+    path::Path,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use wgpu_profiler::GpuProfiler;
 use wgpu_utils::uniformbuffer::UniformBuffer;
 
 fn create_volume_texture_desc(label: &str, grid_dimension: wgpu::Extent3d, format: wgpu::TextureFormat) -> wgpu::TextureDescriptor {
@@ -15,7 +20,8 @@ fn create_volume_texture_desc(label: &str, grid_dimension: wgpu::Extent3d, forma
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
         format,
-        usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[] as &[wgpu::TextureFormat],
     }
 }
 
@@ -48,8 +54,13 @@ pub struct PressureSolver {
 
 const NUM_PRESSURE_ERROR_BUFFER: usize = 32;
 
-struct PendingErrorBuffer {
-    copy_operation: Option<Pin<Box<dyn Future<Output = std::result::Result<(), wgpu::BufferAsyncError>>>>>,
+struct ScheduledErrorBufferReadback {
+    buffer: wgpu::Buffer,
+    resulting_sample: SolverStatisticSample,
+}
+
+struct PendingErrorBufferReadback {
+    map_ready: Arc<AtomicBool>,
     buffer: wgpu::Buffer,
     resulting_sample: SolverStatisticSample,
 }
@@ -87,8 +98,8 @@ pub struct PressureField {
     volume_pressure_view: wgpu::TextureView,
 
     unused_error_buffers: Vec<wgpu::Buffer>,
-    unscheduled_error_readbacks: Vec<PendingErrorBuffer>,
-    pending_error_readbacks: VecDeque<PendingErrorBuffer>,
+    unscheduled_error_readbacks: Vec<ScheduledErrorBufferReadback>,
+    pending_error_readbacks: VecDeque<PendingErrorBufferReadback>,
 
     config_ubo: SolverConfigUniformBuffer,
     pub config: SolverConfig,
@@ -119,7 +130,7 @@ impl PressureField {
         for i in 0..NUM_PRESSURE_ERROR_BUFFER {
             unused_error_buffers.push(device.create_buffer(&wgpu::BufferDescriptor {
                 size: 8,
-                usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 label: Some(&format!("Buffer: Pressure error read-back buffer {} ({})", i, name)),
                 mapped_at_creation: false,
             }));
@@ -145,30 +156,32 @@ impl PressureField {
         &self.volume_pressure_view
     }
 
-    fn retrieve_new_error_samples(&mut self, simulation_delta: Duration) {
+    fn retrieve_new_error_samples(&mut self, simulation_delta: Duration, device: &wgpu::Device) {
         // Check if there's any new data samples
-        while let Some(mut readback) = self.pending_error_readbacks.pop_front() {
-            if (&mut readback.copy_operation.as_mut().unwrap()).now_or_never().is_some() {
-                let mapped = readback.buffer.slice(0..8);
-                let buffer_data = mapped.get_mapped_range().to_vec();
-                let max_error = *bytemuck::from_bytes::<f32>(&buffer_data[0..4]);
-                let iteration_count = *bytemuck::from_bytes::<f32>(&buffer_data[4..8]);
-                readback.buffer.unmap();
-                self.unused_error_buffers.push(readback.buffer);
+        while let Some(readback) = self.pending_error_readbacks.pop_front() {
+            let _ = device.poll(wgpu::PollType::Poll);
 
-                // We always deal with 'pressure * dt / density' in the solver, not with pressure.
-                // To make display more representative for different time, we adjust our error value accordingly.
-                // See also config.error_tolerance
-                readback.resulting_sample.error = max_error * simulation_delta.as_secs_f32();
-                readback.resulting_sample.iteration_count = iteration_count as i32;
-
-                self.stats.push_back(readback.resulting_sample);
-                while self.stats.len() > Self::SOLVER_STATISTIC_HISTORY_LENGTH {
-                    self.stats.pop_front();
-                }
-            } else {
+            if !readback.map_ready.load(Ordering::Acquire) {
                 self.pending_error_readbacks.push_front(readback);
                 break;
+            }
+
+            let buffer_data = readback.buffer.slice(0..8).get_mapped_range().to_vec();
+            let max_error = *bytemuck::from_bytes::<f32>(&buffer_data[0..4]);
+            let iteration_count = *bytemuck::from_bytes::<f32>(&buffer_data[4..8]);
+            readback.buffer.unmap();
+            self.unused_error_buffers.push(readback.buffer);
+
+            // We always deal with 'pressure * dt / density' in the solver, not with pressure.
+            // To make display more representative for different time, we adjust our error value accordingly.
+            // See also config.error_tolerance
+            let mut sample = readback.resulting_sample;
+            sample.error = max_error * simulation_delta.as_secs_f32();
+            sample.iteration_count = iteration_count as i32;
+
+            self.stats.push_back(sample);
+            while self.stats.len() > Self::SOLVER_STATISTIC_HISTORY_LENGTH {
+                self.stats.pop_front();
             }
         }
     }
@@ -176,8 +189,7 @@ impl PressureField {
     fn enqueue_error_buffer_read(&mut self, encoder: &mut wgpu::CommandEncoder, source_buffer: &wgpu::Buffer) {
         if let Some(target_buffer) = self.unused_error_buffers.pop() {
             encoder.copy_buffer_to_buffer(source_buffer, 8, &target_buffer, 0, 8);
-            self.unscheduled_error_readbacks.push(PendingErrorBuffer {
-                copy_operation: None, // Filled out in start_error_buffer_readbacks
+            self.unscheduled_error_readbacks.push(ScheduledErrorBufferReadback {
                 buffer: target_buffer,
                 resulting_sample: SolverStatisticSample {
                     error: 0.0,
@@ -202,9 +214,18 @@ impl PressureField {
 
     // Call this once all command
     pub fn start_error_buffer_readbacks(&mut self) {
-        for mut readback in self.unscheduled_error_readbacks.drain(..) {
-            readback.copy_operation = Some(readback.buffer.slice(..).map_async(wgpu::MapMode::Read).boxed());
-            self.pending_error_readbacks.push_back(readback);
+        for readback in self.unscheduled_error_readbacks.drain(..) {
+            let map_ready = Arc::new(AtomicBool::new(false));
+            let done = Arc::clone(&map_ready);
+            readback.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                r.expect("pressure error buffer map_async failed");
+                done.store(true, Ordering::Release);
+            });
+            self.pending_error_readbacks.push_back(PendingErrorBufferReadback {
+                map_ready,
+                buffer: readback.buffer,
+                resulting_sample: readback.resulting_sample,
+            });
         }
     }
 }
@@ -251,7 +272,7 @@ impl PressureSolver {
             .create(device, "BindGroupLayout: Pressure solver init");
         let group_layout_apply_coeff = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(false))
-            .next_binding_compute(binding_glsl::texture3D())
+            .next_binding_compute(binding_glsl::texture3D_non_filterable())
             .create(device, "BindGroupLayout: P. solver apply coeff matrix & start dot");
         let group_layout_reduce = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(true)) // source
@@ -259,12 +280,12 @@ impl PressureSolver {
             .create(device, "BindGroupLayout: Pressure solver dot product reduce");
         let group_layout_preconditioner = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(false))
-            .next_binding_compute(binding_glsl::texture3D())
+            .next_binding_compute(binding_glsl::texture3D_non_filterable())
             .next_binding_compute(binding_glsl::image3D(
                 wgpu::TextureFormat::R32Float,
                 wgpu::StorageTextureAccess::ReadWrite,
             ))
-            .next_binding_compute(binding_glsl::texture3D())
+            .next_binding_compute(binding_glsl::texture3D_non_filterable())
             .create(device, "BindGroupLayout: Pressure solver preconditioner");
         let group_layout_update_volume = BindGroupLayoutBuilder::new()
             .next_binding_compute(binding_glsl::buffer(false))
@@ -272,61 +293,58 @@ impl PressureSolver {
                 wgpu::TextureFormat::R32Float,
                 wgpu::StorageTextureAccess::ReadWrite,
             ))
-            .next_binding_compute(binding_glsl::texture3D())
+            .next_binding_compute(binding_glsl::texture3D_non_filterable())
             .next_binding_compute(binding_glsl::uniform())
             .create(device, "BindGroupLayout: Pressure solver generic volume update");
 
-        // Use same push constant range for all pipelines to improve internal Vulkan pipeline compatibility.
-        let push_constant_ranges = &[wgpu::PushConstantRange {
-            stages: wgpu::ShaderStage::COMPUTE,
-            range: 0..8,
-        }];
+        // Same immediate blob size for all pressure pipelines (see shader push_constant block).
+        const PRESSURE_PIPELINE_IMMEDIATE_SIZE: u32 = 8;
 
         let layout_update_volume = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Update Volume Pipeline Layout"),
             bind_group_layouts: &[
-                &group_layout_general.layout,
-                &group_layout_pressure_field.layout,
-                &group_layout_update_volume.layout,
+                Some(&group_layout_general.layout),
+                Some(&group_layout_pressure_field.layout),
+                Some(&group_layout_update_volume.layout),
             ],
-            push_constant_ranges,
+            immediate_size: PRESSURE_PIPELINE_IMMEDIATE_SIZE,
         }));
         let layout_preconditioner = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pressure Solve Precondition Pipeline Layout"),
             bind_group_layouts: &[
-                &group_layout_general.layout,
-                &group_layout_pressure_field.layout,
-                &group_layout_preconditioner.layout,
+                Some(&group_layout_general.layout),
+                Some(&group_layout_pressure_field.layout),
+                Some(&group_layout_preconditioner.layout),
             ],
-            push_constant_ranges,
+            immediate_size: PRESSURE_PIPELINE_IMMEDIATE_SIZE,
         }));
         let layout_init = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pressure Solve Init Pipeline Layout"),
             bind_group_layouts: &[
-                &group_layout_general.layout,
-                &group_layout_pressure_field.layout,
-                &group_layout_init.layout,
+                Some(&group_layout_general.layout),
+                Some(&group_layout_pressure_field.layout),
+                Some(&group_layout_init.layout),
             ],
-            push_constant_ranges,
+            immediate_size: PRESSURE_PIPELINE_IMMEDIATE_SIZE,
         }));
 
         let layout_apply_coeff = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pressure Solve Apply Coeff Pipeline Layout"),
             bind_group_layouts: &[
-                &group_layout_general.layout,
-                &group_layout_pressure_field.layout,
-                &group_layout_apply_coeff.layout,
+                Some(&group_layout_general.layout),
+                Some(&group_layout_pressure_field.layout),
+                Some(&group_layout_apply_coeff.layout),
             ],
-            push_constant_ranges,
+            immediate_size: PRESSURE_PIPELINE_IMMEDIATE_SIZE,
         }));
         let layout_reduce = Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pressure Solve Reduce Pipeline Layout"),
             bind_group_layouts: &[
-                &group_layout_general.layout,
-                &group_layout_pressure_field.layout,
-                &group_layout_reduce.layout,
+                Some(&group_layout_general.layout),
+                Some(&group_layout_pressure_field.layout),
+                Some(&group_layout_reduce.layout),
             ],
-            push_constant_ranges,
+            immediate_size: PRESSURE_PIPELINE_IMMEDIATE_SIZE,
         }));
 
         let volume_residual = device.create_texture(&create_volume_texture_desc(
@@ -355,20 +373,20 @@ impl PressureSolver {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Buffer: DotProduct Reduce 0"),
                 size: num_cells * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsage::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Buffer: DotProduct Reduce 1"),
                 size: num_cells * std::mem::size_of::<f32>() as u64 / Self::REDUCE_REDUCTION_PER_STEP as u64,
-                usage: wgpu::BufferUsage::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
         ];
         let dotproduct_reduce_result_and_dispatch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Buffer: DotProduct Result & IndirectDispatch buffer"),
             size: 16 * std::mem::size_of::<f32>() as u64,
-            usage: wgpu::BufferUsage::INDIRECT | wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_SRC,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -560,15 +578,15 @@ impl PressureSolver {
         let mut reduce_step_idx = 0;
         while num_entries_remaining > Self::REDUCE_REDUCTION_PER_STEP {
             cpass.set_bind_group(2, &self.bind_group_dotproduct_reduce[source_buffer_index], &[]);
-            cpass.set_push_constants(0, &bytemuck::bytes_of(&[Self::REDUCE_RESULTMODE_REDUCE, num_entries_remaining]));
+            cpass.set_immediates(0, &bytemuck::bytes_of(&[Self::REDUCE_RESULTMODE_REDUCE, num_entries_remaining]));
 
             if reduce_step_idx < DISPATCH_BUFFER_OFFSETS.len() {
-                cpass.dispatch_indirect(
+                cpass.dispatch_workgroups_indirect(
                     &self.dotproduct_reduce_result_and_dispatch_buffer,
                     DISPATCH_BUFFER_OFFSETS[reduce_step_idx],
                 )
             } else {
-                cpass.dispatch(
+                cpass.dispatch_workgroups(
                     wgpu_utils::compute_group_size_1d(num_entries_remaining / Self::REDUCE_READS_PER_THREAD, Self::COMPUTE_LOCAL_SIZE_REDUCE),
                     1,
                     1,
@@ -584,8 +602,8 @@ impl PressureSolver {
         // Right now not a dispatch_indirect, so we always run it even if we decided that it is no longer necessary.
         // It's simply a bit too tricky to turn it off - we can't write into a dispatch buffer that is in use
         cpass.set_bind_group(2, &self.bind_group_dotproduct_final[source_buffer_index], &[]);
-        cpass.set_push_constants(0, &bytemuck::bytes_of(&[result_mode, num_entries_remaining]));
-        cpass.dispatch(1, 1, 1);
+        cpass.set_immediates(0, &bytemuck::bytes_of(&[result_mode, num_entries_remaining]));
+        cpass.dispatch_workgroups(1, 1, 1);
     }
 
     pub fn solve<'a, 'b: 'a>(
@@ -604,12 +622,13 @@ impl PressureSolver {
 
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("pressure solve"),
+            timestamp_writes: None,
         });
 
         const PRECONDITIONER_PASS0: u32 = 0;
         const PRECONDITIONER_PASS1: u32 = 1;
 
-        pressure_field.retrieve_new_error_samples(simulation_delta);
+        pressure_field.retrieve_new_error_samples(simulation_delta, device);
 
         let reduce_pass_initial_group_size = wgpu_utils::compute_group_size_1d(
             (self.grid_dimension.width * self.grid_dimension.height * self.grid_dimension.depth_or_array_layers) as u32
@@ -622,73 +641,73 @@ impl PressureSolver {
 
         // For optimization various steps are collapsed as far as possible to avoid expensive buffer/texture read/writes
         // This makes the algorithm a lot faster but also a bit harder to read.
-        wgpu_profiler!("init", profiler, &mut cpass, device, {
+        crate::wgpu_profiler!("init", profiler, &mut cpass, device, {
             let grid_work_groups = wgpu_utils::compute_group_size(self.grid_dimension, Self::COMPUTE_LOCAL_SIZE_VOLUME);
 
             // We use pressure from last frame, but set explicitly set all pressure values to zero wherever there is not fluid right now.
             // This is done in order to prevent having results from many frames ago influence results for upcoming frames.
             cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_init));
             cpass.set_bind_group(2, &self.bind_group_init, &[]);
-            cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+            cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
 
             // Apply preconditioner on (r), store result to search vector (s) and start dotproduct of <s; r>
             // Note that we don't use the auxillary vector here as in-between storage!
-            wgpu_profiler!("preconditioner(r) ➡ s, start s·r", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("preconditioner(r) ➡ s, start s·r", profiler, &mut cpass, device, {
                 cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_apply_preconditioner));
-                cpass.set_push_constants(0, &bytemuck::bytes_of(&[0 as u32]));
-                cpass.set_push_constants(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS0]));
+                cpass.set_immediates(0, &bytemuck::bytes_of(&[0 as u32]));
+                cpass.set_immediates(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS0]));
                 cpass.set_bind_group(2, &self.bind_group_preconditioner[0], &[]);
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
-                cpass.set_push_constants(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS1, reduce_pass_initial_group_size]));
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.set_immediates(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS1, reduce_pass_initial_group_size]));
                 cpass.set_bind_group(2, &self.bind_group_preconditioner[2], &[]);
-                cpass.dispatch(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
+                cpass.dispatch_workgroups(grid_work_groups.width, grid_work_groups.height, grid_work_groups.depth_or_array_layers);
             });
-            wgpu_profiler!("reduce_add: finish s·r ➡ sigma", profiler, &mut cpass, device, {
+            crate::wgpu_profiler!("reduce_add: finish s·r ➡ sigma", profiler, &mut cpass, device, {
                 self.reduce_add(&mut cpass, pipeline_manager, Self::REDUCE_RESULTMODE_INIT);
             });
         });
 
-        wgpu_profiler!("solver iterations", profiler, &mut cpass, device, {
+        crate::wgpu_profiler!("solver iterations", profiler, &mut cpass, device, {
             const DISPATCH_BUFFER_OFFSET: u64 = 4 * 4;
 
             let mut i = 0;
-            while wgpu_profiler!(
+            while crate::wgpu_profiler!(
                 &format!("iteration {}", i),
                 profiler,
                 &mut cpass,
                 device,
                 (|| {
-                    wgpu_profiler!("sA ➡ z, start s·z", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("sA ➡ z, start s·z", profiler, &mut cpass, device, {
                         // The dot product is applied to the result (denoted as z in Bridson's book) and the search vector (s), i.e. compute <s; As>
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_apply_coeff));
                         cpass.set_bind_group(2, &self.bind_group_apply_coeff, &[]);
-                        cpass.set_push_constants(0, &bytemuck::bytes_of(&[0, reduce_pass_initial_group_size]));
-                        cpass.dispatch_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
+                        cpass.set_immediates(0, &bytemuck::bytes_of(&[0, reduce_pass_initial_group_size]));
+                        cpass.dispatch_workgroups_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
                     });
-                    wgpu_profiler!("reduce_add: finish s·z ➡ alpha", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("reduce_add: finish s·z ➡ alpha", profiler, &mut cpass, device, {
                         self.reduce_add(&mut cpass, pipeline_manager, Self::REDUCE_RESULTMODE_ALPHA);
                     });
 
                     let iteration_with_error_computation =
                         pressure_field.config.max_num_iterations == i || (i > 0 && i % pressure_field.config.error_check_frequency == 0);
 
-                    wgpu_profiler!("update pressure field (p) & residual field (r)", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("update pressure field (p) & residual field (r)", profiler, &mut cpass, device, {
                         const PRUPDATE_COMPUTE_MAX_ERROR: u32 = 1;
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_update_pressure_and_residual));
                         if iteration_with_error_computation {
-                            cpass.set_push_constants(0, &bytemuck::bytes_of(&[PRUPDATE_COMPUTE_MAX_ERROR, reduce_pass_initial_group_size]));
+                            cpass.set_immediates(0, &bytemuck::bytes_of(&[PRUPDATE_COMPUTE_MAX_ERROR, reduce_pass_initial_group_size]));
                         } else {
-                            cpass.set_push_constants(0, &bytemuck::bytes_of(&[0]));
+                            cpass.set_immediates(0, &bytemuck::bytes_of(&[0]));
                         }
                         cpass.set_bind_group(2, &self.bind_group_update_pressure_and_residual, &[]);
-                        cpass.dispatch_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
+                        cpass.dispatch_workgroups_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
                     });
 
                     // Time to check on error?
                     if iteration_with_error_computation {
                         // Compute remaining error.
                         // Used for statistics. If below target, makes all upcoming dispatch_indirect no-ops.
-                        wgpu_profiler!("reduce: compute max error", profiler, &mut cpass, device, {
+                        crate::wgpu_profiler!("reduce: compute max error", profiler, &mut cpass, device, {
                             self.reduce_max(&mut cpass, pipeline_manager, Self::REDUCE_RESULTMODE_MAX_ERROR + i as u32);
                         });
 
@@ -697,24 +716,24 @@ impl PressureSolver {
                         }
                     }
 
-                    wgpu_profiler!("preconditioner(r) ➡ (z), start z·r", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("preconditioner(r) ➡ (z), start z·r", profiler, &mut cpass, device, {
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_apply_preconditioner));
-                        cpass.set_push_constants(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS0]));
+                        cpass.set_immediates(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS0]));
                         cpass.set_bind_group(2, &self.bind_group_preconditioner[0], &[]);
-                        cpass.dispatch_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
-                        cpass.set_push_constants(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS1, reduce_pass_initial_group_size]));
+                        cpass.dispatch_workgroups_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
+                        cpass.set_immediates(0, &bytemuck::bytes_of(&[PRECONDITIONER_PASS1, reduce_pass_initial_group_size]));
                         cpass.set_bind_group(2, &self.bind_group_preconditioner[1], &[]);
-                        cpass.dispatch_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
+                        cpass.dispatch_workgroups_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
                     });
 
-                    wgpu_profiler!("reduce_add: finish z·r ➡ beta", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("reduce_add: finish z·r ➡ beta", profiler, &mut cpass, device, {
                         self.reduce_add(&mut cpass, pipeline_manager, Self::REDUCE_RESULTMODE_BETA);
                     });
 
-                    wgpu_profiler!("Update search vector (s)", profiler, &mut cpass, device, {
+                    crate::wgpu_profiler!("Update search vector (s)", profiler, &mut cpass, device, {
                         cpass.set_pipeline(pipeline_manager.get_compute(&self.pipeline_update_search));
                         cpass.set_bind_group(2, &self.bind_group_update_search, &[]);
-                        cpass.dispatch_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
+                        cpass.dispatch_workgroups_indirect(&self.dotproduct_reduce_result_and_dispatch_buffer, DISPATCH_BUFFER_OFFSET);
                     });
 
                     i += 1;

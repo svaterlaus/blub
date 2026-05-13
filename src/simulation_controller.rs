@@ -4,7 +4,7 @@ use crate::{
     wgpu_utils::pipelines::PipelineManager,
 };
 use std::time::{Duration, Instant};
-use wgpu_profiler::GpuProfiler;
+use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
 
 // The simulation controller orchestrates simulation steps.
 // It holds the central timer and as such is responsible for glueing rendering frames and simulation together.
@@ -119,9 +119,15 @@ impl SimulationController {
         self.simulation_stop_time = self.timer.total_simulated_time() + simulation_jump_length.max(self.timer.simulation_delta());
         let num_expected_steps = simulation_jump_length.max(self.timer.simulation_delta()).as_nanos() / self.timer.simulation_delta().as_nanos();
 
-        let mut dummy_profiler = GpuProfiler::new(1, 0.0);
-        dummy_profiler.enable_timer = false;
-        dummy_profiler.enable_debug_marker = false;
+        let mut dummy_profiler = GpuProfiler::new(
+            device,
+            GpuProfilerSettings {
+                enable_timer_queries: false,
+                enable_debug_groups: false,
+                ..Default::default()
+            },
+        )
+        .expect("GpuProfiler dummy");
 
         self.start_simulation_frame();
         {
@@ -137,7 +143,7 @@ impl SimulationController {
                         }
                     }
                 }
-                device.poll(wgpu::Maintain::Wait);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
                 num_steps_finished += batch_size;
                 info!(
                     "simulation fast forwarding batch finished (progress {}/{})",

@@ -7,7 +7,7 @@ use std::{path::Path, rc::Rc};
 
 pub struct Screen {
     resolution: winit::dpi::PhysicalSize<u32>,
-    swap_chain: wgpu::SwapChain,
+    surface_config: wgpu::SurfaceConfiguration,
     present_mode: wgpu::PresentMode,
 
     backbuffer: wgpu::Texture,
@@ -29,13 +29,45 @@ pub struct ScreenUniformBufferContent {
 
 impl Screen {
     pub const FORMAT_BACKBUFFER: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-    const FORMAT_SWAPCHAIN: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
     pub const FORMAT_DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
     pub const DEFAULT_PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Fifo;
 
+    fn build_surface_config(surface: &wgpu::Surface, adapter: &wgpu::Adapter, present_mode: wgpu::PresentMode, resolution: winit::dpi::PhysicalSize<u32>) -> wgpu::SurfaceConfiguration {
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Rgba8UnormSrgb))
+            .unwrap_or(caps.formats[0]);
+        let present_mode = caps
+            .present_modes
+            .iter()
+            .copied()
+            .find(|&m| m == present_mode)
+            .unwrap_or(caps.present_modes[0]);
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|&m| m == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(caps.alpha_modes[0]);
+        wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: resolution.width.max(1),
+            height: resolution.height.max(1),
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        }
+    }
+
     pub fn new(
         device: &wgpu::Device,
-        window_surface: &wgpu::Surface,
+        surface: &wgpu::Surface<'_>,
+        adapter: &wgpu::Adapter,
         present_mode: wgpu::PresentMode,
         resolution: winit::dpi::PhysicalSize<u32>,
         shader_dir: &ShaderDirectory,
@@ -43,20 +75,12 @@ impl Screen {
     ) -> Self {
         info!("creating screen with {:?}", resolution);
 
-        let swap_chain = device.create_swap_chain(
-            window_surface,
-            &wgpu::SwapChainDescriptor {
-                usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-                format: Screen::FORMAT_SWAPCHAIN,
-                width: resolution.width,
-                height: resolution.height,
-                present_mode,
-            },
-        );
+        let surface_config = Self::build_surface_config(surface, adapter, present_mode, resolution);
+        surface.configure(device, &surface_config);
 
         let size = wgpu::Extent3d {
-            width: resolution.width,
-            height: resolution.height,
+            width: resolution.width.max(1),
+            height: resolution.height.max(1),
             depth_or_array_layers: 1,
         };
 
@@ -67,7 +91,8 @@ impl Screen {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: Self::FORMAT_BACKBUFFER,
-            usage: wgpu::TextureUsage::RENDER_ATTACHMENT | wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[Self::FORMAT_BACKBUFFER],
         });
         let backbuffer_view = backbuffer.create_view(&Default::default());
 
@@ -78,7 +103,8 @@ impl Screen {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: Self::FORMAT_DEPTH,
-            usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[Self::FORMAT_DEPTH],
         });
 
         let bind_group_layout = BindGroupLayoutBuilder::new()
@@ -86,8 +112,8 @@ impl Screen {
             .create(device, "BindGroupLayout: Screen, Read Texture");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Screen Swapchain Copy Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout.layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout.layout)],
+            immediate_size: 0,
         });
 
         let read_backbuffer_bind_group = BindGroupBuilder::new(&bind_group_layout)
@@ -102,14 +128,14 @@ impl Screen {
                 Rc::new(pipeline_layout),
                 Path::new("screentri.vert"),
                 Path::new("copy_texture.frag"),
-                Self::FORMAT_SWAPCHAIN,
+                surface_config.format,
                 None,
             ),
         );
 
         Screen {
             resolution,
-            swap_chain,
+            surface_config,
             present_mode,
             backbuffer,
             backbuffer_view,
@@ -141,64 +167,79 @@ impl Screen {
         self.present_mode
     }
 
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_config.format
+    }
+
+    pub fn configure_after_resize_or_present_change(
+        &mut self,
+        device: &wgpu::Device,
+        surface: &wgpu::Surface<'_>,
+        adapter: &wgpu::Adapter,
+        present_mode: wgpu::PresentMode,
+        resolution: winit::dpi::PhysicalSize<u32>,
+    ) {
+        self.present_mode = present_mode;
+        self.surface_config = Self::build_surface_config(surface, adapter, present_mode, resolution);
+        surface.configure(device, &self.surface_config);
+    }
+
     pub fn capture_screenshot(&mut self, path: &Path, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         self.screenshot_capture.capture_screenshot(path, &self.backbuffer, device, encoder);
     }
 
-    pub fn start_frame(&mut self, device: &wgpu::Device, window_surface: &wgpu::Surface) -> wgpu::SwapChainTexture {
-        // We assume here that any resizing has already been handled.
-        // In that case it can still sometimes happen that the swap chain doesn't give a valid frame, e.g. after getting back from minimized state.
-        // The problem usually goes away after recreating the swap chain.
-        match self.swap_chain.get_current_frame() {
-            Ok(frame) => frame.output,
-            Err(_) => {
-                info!(
-                    "Failed to query current frame from swap chain. Recreating swap chain (resolution {:?}, present mode {:?})",
-                    self.resolution, self.present_mode
-                );
-                self.swap_chain = device.create_swap_chain(
-                    window_surface,
-                    &wgpu::SwapChainDescriptor {
-                        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-                        format: Screen::FORMAT_SWAPCHAIN,
-                        width: self.resolution.width,
-                        height: self.resolution.height,
-                        present_mode: self.present_mode,
-                    },
-                );
-                self.swap_chain.get_current_frame().unwrap().output
+    pub fn acquire_surface_texture(&mut self, device: &wgpu::Device, surface: &wgpu::Surface<'_>) -> Option<wgpu::SurfaceTexture> {
+        loop {
+            match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => return Some(frame),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => return Some(frame),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    info!(
+                        "surface outdated or lost — reconfigure (resolution {:?}, present mode {:?})",
+                        self.resolution, self.present_mode
+                    );
+                    surface.configure(device, &self.surface_config);
+                }
+                wgpu::CurrentSurfaceTexture::Timeout => {
+                    return None;
+                }
+                wgpu::CurrentSurfaceTexture::Occluded => {
+                    return None;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    error!("surface get_current_texture validation error");
+                    return None;
+                }
             }
         }
     }
 
-    pub fn copy_to_swapchain(&mut self, output: &wgpu::SwapChainTexture, encoder: &mut wgpu::CommandEncoder, pipeline_manager: &PipelineManager) {
-        // why this extra copy?
-        // Webgpu doesn't allow us to do anything with the swapchain target but read from it!
-        // That means that we can never take a screenshot.
-        //
-        // The only thing that could be done better here is to avoid this copy for frames that don't take screenshots.
-        // However, this would require that backbuffer() gives out a different texture depending on whether this is a frame with or without screenshot.
-        // Right now this is not possible since they have different formats. Could fix that, but all it safes us is this copy here (can't remove the buffer either)
+    pub fn copy_to_swapchain(&mut self, output: &wgpu::SurfaceTexture, encoder: &mut wgpu::CommandEncoder, pipeline_manager: &PipelineManager) {
+        let swap_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("copy to swapchain"),
-            color_attachments: &[wgpu::RenderPassColorAttachment {
-                view: &output.view,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &swap_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: true,
+                    store: wgpu::StoreOp::Store,
                 },
-            }],
+            })],
             depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
         render_pass.set_pipeline(pipeline_manager.get_render(&self.copy_to_swapchain_pipeline));
         render_pass.set_bind_group(0, &self.read_backbuffer_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
 
-    pub fn end_frame(&mut self, frame: wgpu::SwapChainTexture) {
-        std::mem::drop(frame);
-        self.screenshot_capture.process_pending_screenshots();
+    pub fn end_frame_present(&mut self, frame: wgpu::SurfaceTexture, device: &wgpu::Device) {
+        frame.present();
+        self.screenshot_capture.process_pending_screenshots(device);
     }
 
     pub fn wait_for_pending_screenshots(&mut self, device: &wgpu::Device) {

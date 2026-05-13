@@ -9,5 +9,6 @@ COMPUTE_PASS_PARTICLES
 void main() {
     uint particleIndex = gl_GlobalInvocationID.x;
     ivec3 cellCoordinate = ivec3(Old_Particles[particleIndex].Position);
-    Old_Particles[particleIndex].LinkedListNext = imageAtomicAdd(ParticleBinningVolume, cellCoordinate, 1);
+    Old_Particles[particleIndex].LinkedListNext =
+        atomicAdd(FluidDualGridCells.Cells[fluid_grid_cell_linear_index(cellCoordinate)], 1u);
 }

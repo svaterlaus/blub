@@ -2,7 +2,10 @@ use super::timer::Timer;
 use super::wgpu_utils::uniformbuffer::*;
 use cgmath::prelude::*;
 use enumflags2::{bitflags, BitFlags};
-use winit::event::{DeviceEvent, ElementState, KeyboardInput, VirtualKeyCode, WindowEvent};
+use winit::{
+    event::{DeviceEvent, ElementState, MouseButton, RawKeyEvent, WindowEvent},
+    keyboard::{KeyCode, PhysicalKey},
+};
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const OPENGL_PROJECTION_TO_WGPU_PROJECTION: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -38,6 +41,17 @@ pub struct Camera {
     rotation_speed: f32,
 }
 
+fn move_flags_for_physical_key(code: PhysicalKey) -> BitFlags<MoveCommands> {
+        match code {
+        PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => BitFlags::from(MoveCommands::Backwards),
+        PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => BitFlags::from(MoveCommands::Left),
+        PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => BitFlags::from(MoveCommands::Right),
+        PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => BitFlags::from(MoveCommands::Forwards),
+        PhysicalKey::Code(KeyCode::ShiftLeft | KeyCode::ShiftRight) => BitFlags::from(MoveCommands::SpeedUp),
+        _ => Default::default(),
+    }
+}
+
 impl Camera {
     pub fn new() -> Camera {
         let position = cgmath::Point3::new(1.0f32, 1.0, 1.0);
@@ -57,32 +71,22 @@ impl Camera {
 
     pub fn on_window_event(&mut self, event: &WindowEvent) {
         match event {
-            WindowEvent::KeyboardInput {
-                // Ugh, that should probably be ScanCode otherwise non-querty/quertz people are going to be angry with me.
-                // But using ScanCode is cumbersome since there's no defines. So whatever...
-                input:
-                    KeyboardInput {
-                        virtual_keycode: Some(virtual_keycode),
-                        state,
-                        ..
-                    },
-                ..
-            } => {
-                let direction = match virtual_keycode {
-                    VirtualKeyCode::S | VirtualKeyCode::Down => BitFlags::from(MoveCommands::Backwards),
-                    VirtualKeyCode::A | VirtualKeyCode::Left => BitFlags::from(MoveCommands::Left),
-                    VirtualKeyCode::D | VirtualKeyCode::Right => BitFlags::from(MoveCommands::Right),
-                    VirtualKeyCode::W | VirtualKeyCode::Up => BitFlags::from(MoveCommands::Forwards),
-                    VirtualKeyCode::LShift => BitFlags::from(MoveCommands::SpeedUp),
-                    _ => Default::default(),
-                };
-                match state {
-                    ElementState::Pressed => self.active_move_commands.insert(direction),
-                    ElementState::Released => self.active_move_commands.remove(direction),
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                let flags = move_flags_for_physical_key(key.physical_key);
+                if flags.is_empty() {
+                    return;
+                }
+                match key.state {
+                    ElementState::Pressed => {
+                        self.active_move_commands.insert(flags);
+                    }
+                    ElementState::Released => {
+                        self.active_move_commands.remove(flags);
+                    }
                 };
             }
             WindowEvent::MouseInput { button, state, .. } => {
-                if *button == winit::event::MouseButton::Right {
+                if *button == MouseButton::Right {
                     self.movement_locked = *state == ElementState::Released;
                 }
             }
@@ -94,6 +98,16 @@ impl Camera {
         match event {
             DeviceEvent::MouseMotion { delta } => {
                 self.mouse_delta = (self.mouse_delta.0 + delta.0, self.mouse_delta.1 + delta.1);
+            }
+            DeviceEvent::Key(RawKeyEvent { physical_key, state }) => {
+                let flags = move_flags_for_physical_key(*physical_key);
+                if flags.is_empty() {
+                    return;
+                }
+                match state {
+                    ElementState::Pressed => self.active_move_commands.insert(flags),
+                    ElementState::Released => self.active_move_commands.remove(flags),
+                };
             }
             _ => {}
         }
@@ -133,7 +147,6 @@ impl Camera {
         let projection = OPENGL_PROJECTION_TO_WGPU_PROJECTION * cgmath::perspective(VERTICAL_FOV, aspect_ratio, 0.01, 1000.0);
         let view_projection = projection * view;
         let inverse_projection = projection.invert().unwrap();
-        //let inverse_view_projection = view_projection.invert().unwrap();
 
         let ndc_corner_camera = inverse_projection.transform_point(cgmath::point3(1.0, 1.0, 0.0));
         let ndc_camera_space_projected = cgmath::point2(-ndc_corner_camera.x / ndc_corner_camera.z, -ndc_corner_camera.y / ndc_corner_camera.z);

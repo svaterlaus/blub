@@ -21,15 +21,15 @@ impl VoxelRenderer {
         background_and_lighting_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let group_layout = BindGroupLayoutBuilder::new()
-            .next_binding(wgpu::ShaderStage::VERTEX_FRAGMENT, binding_glsl::texture3D())
+            .next_binding(wgpu::ShaderStages::VERTEX_FRAGMENT, binding_glsl::texture3D())
             .create(device, "BindGroupLayout: Voxel Renderer");
 
         let mut desc = RenderPipelineCreationDesc::new(
             "Visualize Voxels",
             Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Visualize Voxels Pipeline Layout"),
-                bind_group_layouts: &[&global_bind_group_layout, background_and_lighting_group_layout, &group_layout.layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(global_bind_group_layout), Some(background_and_lighting_group_layout), Some(&group_layout.layout)],
+                immediate_size: 0,
             })),
             Path::new("volume_visualization/voxel_visualization.vert"),
             Path::new("volume_visualization/voxel_visualization.frag"),

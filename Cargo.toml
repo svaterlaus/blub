@@ -1,40 +1,37 @@
 [package]
 authors = ["Andreas Reich <r_andreas2@web.de>"]
-edition = "2018"
+edition = "2021"
 name = "blub"
 version = "0.1.0"
 resolver = "2"
 
 [dependencies]
-bytemuck = "1.4.1"
-cgmath = {version = "0.18.0", features = ["rand", "serde"]}
-enumflags2 = "0.7.1"
-env_logger = "0.9"
+bytemuck = "1.14"
+cgmath = { version = "0.18", features = ["rand", "serde"] }
+enumflags2 = "0.7"
+env_logger = "0.11"
 futures = "0.3"
-image = {version = "0.23", default-features = false, features = ["png", "hdr"]}
-lazy_static = "1.4"
+image = { version = "0.25", default-features = false, features = ["png", "hdr"] }
+lazy_static = "1.5"
 log = "0.4"
-more-asserts = "0.2"
-notify = "5.0.0"
-rand = {version = "0.8.3", features = ["small_rng"]}
+more-asserts = "0.3"
+notify = "6.1"
+pollster = "0.4"
+rand = { version = "0.8", features = ["small_rng"] }
 regex = "1"
-serde = {version = "1.0", features = ["derive"]}
-serde_json = "1.0"
-shaderc = "0.7"
-strum = "0.21"
-strum_macros = "0.21"
-tobj = "3.0.0"
-wgpu = "0.9"
-wgpu-profiler = "0.5"
-winit = "0.25"
-# egui and related
-egui = "0.13"
-epi = "0.13"
-egui_wgpu_backend = "0.10"
-egui_winit_platform = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shaderc = "0.8"
+strum = "0.26"
+strum_macros = "0.26"
+tobj = "4"
+
+wgpu = { version = "29", features = ["spirv"] }
+wgpu-profiler = "0.27"
+winit = "0.30"
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
 
 [profile.dev.package."*"]
 opt-level = 3
-
-[patch.crates-io]
-wgpu = { git = "https://github.com/Wumpf/wgpu.git", commit = "13940628306aeb21ba9af6d9a4d62530d274dab0" }

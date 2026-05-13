@@ -76,9 +76,7 @@ struct MeshData {
     // ivec3 _Padding1;
 };
 layout(set = 0, binding = 3) restrict readonly buffer Meshes_ { MeshData Meshes[]; };
-// Not going with dynamic size (UNSIZED_BINDING_ARRAY extension) for convenience in layout setup (which doesn't change per scene).
-// (also this is more widely supported)
-layout(set = 0, binding = 4) uniform texture2D MeshTextures[1];
+layout(set = 0, binding = 4) uniform texture2D MeshTextureMain;
 
 // Can't do packed layouts in glsl/spirv?
 struct Vertex {
@@ -104,6 +102,12 @@ vec3 reconstructWorldPositionFromViewSpaceDepth(vec2 screenUv, float depth) {
     float y = (1.0 - screenUv.y) * 2.0f - 1.0f;
     vec3 viewSpace = vec3(Camera.NdcCameraSpaceProjected * vec2(x, y) * depth, depth);
     return viewSpace.x * Camera.Right + viewSpace.y * Camera.Up + viewSpace.z * Camera.Direction + Camera.Position;
+}
+
+// Linear texel index for 3D volumes sized FluidGridResolution (same layout as legacy uimage3D).
+uint fluid_grid_cell_linear_index(ivec3 c) {
+    uvec3 r = Rendering.FluidGridResolution;
+    return uint(c.x) + uint(c.y) * r.x + uint(c.z) * r.x * r.y;
 }
 
 #endif // INCLUDE_PERFRAMERESOURCES

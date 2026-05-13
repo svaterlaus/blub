@@ -6,7 +6,7 @@ use crate::{
     timer::Timer,
     wgpu_utils::{pipelines::PipelineManager, shader::ShaderDirectory},
 };
-use wgpu_profiler::{wgpu_profiler, GpuProfiler};
+use wgpu_profiler::GpuProfiler;
 
 use serde::Deserialize;
 use std::{error, fs::File, io::BufReader, path::Path, path::PathBuf};
@@ -139,7 +139,7 @@ impl Scene {
         hybrid_fluid.set_gravity_grid(config.gravity / config.fluid.grid_to_world_scale);
 
         // Creating the fluid is quite heavy, make sure we're done with all the buffer book-keeping before we move on.
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         hybrid_fluid
     }
 
@@ -192,11 +192,11 @@ impl Scene {
         self.models.step(timer, queue, &self.config.fluid);
         //});
 
-        wgpu_profiler!("Voxelize Scene", profiler, &mut encoder, device, {
+        crate::wgpu_profiler!("Voxelize Scene", profiler, &mut encoder, device, {
             self.voxelization.update(&mut encoder, pipeline_manager, global_bind_group, &self.models);
         });
 
-        wgpu_profiler!("HybridFluid step", profiler, &mut encoder, device, {
+        crate::wgpu_profiler!("HybridFluid step", profiler, &mut encoder, device, {
             self.hybrid_fluid.step(
                 timer.simulation_delta(),
                 &mut encoder,

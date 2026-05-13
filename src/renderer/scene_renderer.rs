@@ -16,7 +16,7 @@ use crate::{
 };
 use cgmath::EuclideanSpace;
 use std::path::Path;
-use wgpu_profiler::{wgpu_profiler, GpuProfiler};
+use wgpu_profiler::GpuProfiler;
 
 #[derive(Clone, Copy, Debug, EnumIter, PartialEq)]
 pub enum FluidRenderingMode {
@@ -203,25 +203,29 @@ impl SceneRenderer {
         global_bind_group: &wgpu::BindGroup,
     ) {
         // Opaque
-        wgpu_profiler!("opaque", profiler, encoder, device, {
+        crate::wgpu_profiler!("opaque", profiler, encoder, device, {
             let mut rpass_backbuffer = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opaque"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: backbuffer.texture_view(),
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
-                }],
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depthbuffer,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass_backbuffer.set_bind_group(0, global_bind_group, &[]);
 
@@ -231,7 +235,7 @@ impl SceneRenderer {
                     // Handled earlier!
                 }
                 FluidRenderingMode::ParticlesIndex | FluidRenderingMode::ParticlesVelocity => {
-                    wgpu_profiler!("particles", profiler, &mut rpass_backbuffer, device, {
+                    crate::wgpu_profiler!("particles", profiler, &mut rpass_backbuffer, device, {
                         self.particle_renderer.draw(
                             &mut rpass_backbuffer,
                             pipeline_manager,
@@ -247,7 +251,7 @@ impl SceneRenderer {
             }
 
             if self.enable_mesh_rendering {
-                wgpu_profiler!("meshes", profiler, &mut rpass_backbuffer, device, {
+                crate::wgpu_profiler!("meshes", profiler, &mut rpass_backbuffer, device, {
                     self.mesh_renderer.draw(
                         &mut rpass_backbuffer,
                         pipeline_manager,
@@ -257,19 +261,19 @@ impl SceneRenderer {
                 });
             }
 
-            wgpu_profiler!("volume visualization", profiler, &mut rpass_backbuffer, device, {
+            crate::wgpu_profiler!("volume visualization", profiler, &mut rpass_backbuffer, device, {
                 self.volume_renderer
                     .draw(&mut rpass_backbuffer, pipeline_manager, &scene.fluid(), self.volume_visualization);
             });
 
             if self.enable_box_lines {
-                wgpu_profiler!("box lines", profiler, &mut rpass_backbuffer, device, {
+                crate::wgpu_profiler!("box lines", profiler, &mut rpass_backbuffer, device, {
                     self.bounds_line_renderer.draw(&mut rpass_backbuffer, pipeline_manager);
                 });
             }
 
             if self.enable_voxel_visualization {
-                wgpu_profiler!("voxels", profiler, &mut rpass_backbuffer, device, {
+                crate::wgpu_profiler!("voxels", profiler, &mut rpass_backbuffer, device, {
                     self.voxel_renderer.draw(
                         &mut rpass_backbuffer,
                         pipeline_manager,
@@ -282,15 +286,15 @@ impl SceneRenderer {
             // Background.. not really opaque but we re-use the same rpass.
             // Note that we could do all the background rendering in the ScreenSpaceFluid pass. However, we want to be able to disable it without disabling the background.
             // Also, background rendering could be last, but for that ScreenSpaceFluid pass would need to write out depth [...]
-            wgpu_profiler!("skybox", profiler, &mut rpass_backbuffer, device, {
+            crate::wgpu_profiler!("skybox", profiler, &mut rpass_backbuffer, device, {
                 self.background_and_lighting.draw(&mut rpass_backbuffer, pipeline_manager);
             });
         });
 
         // Transparent
-        wgpu_profiler!("transparent", profiler, encoder, device, {
+        crate::wgpu_profiler!("transparent", profiler, encoder, device, {
             if let FluidRenderingMode::ScreenSpaceFluid = self.fluid_rendering_mode {
-                wgpu_profiler!("ScreenSpaceFluid", profiler, encoder, device, {
+                crate::wgpu_profiler!("ScreenSpaceFluid", profiler, encoder, device, {
                     self.screenspace_fluid.draw(
                         encoder,
                         device,

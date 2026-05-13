@@ -125,20 +125,22 @@ fn load_texture2d_from_path(device: &wgpu::Device, queue: &wgpu::Queue, path: &P
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
     });
 
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
         },
-        &image_data,
-        wgpu::ImageDataLayout {
+        image_data,
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: std::num::NonZeroU32::new(4 * image.width()),
-            rows_per_image: None,
+            bytes_per_row: Some(4 * image.width()),
+            rows_per_image: Some(image.height()),
         },
         wgpu::Extent3d {
             width: image.width(),
@@ -228,7 +230,7 @@ impl SceneModels {
     pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: MeshVertex::SIZE,
-            step_mode: wgpu::InputStepMode::Vertex,
+            step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
@@ -290,15 +292,20 @@ impl SceneModels {
                 };
                 if prev_material_id != material_id {
                     let texture_index: i32 = if let Some(matid) = m.mesh.material_id {
-                        let texture_path = file_name.parent().unwrap().join(&loaded_materials[matid].diffuse_texture);
+                        match loaded_materials[matid].diffuse_texture.as_deref() {
+                            Some(tex_rel) => {
+                                let texture_path = file_name.parent().unwrap().join(tex_rel);
 
-                        let known_texture_index = texture_paths.iter().position(|p| *p == texture_path);
-                        match known_texture_index {
-                            Some(index) => index as i32,
-                            None => {
-                                texture_paths.push(texture_path);
-                                texture_paths.len() as i32 - 1
+                                let known_texture_index = texture_paths.iter().position(|p| *p == texture_path);
+                                match known_texture_index {
+                                    Some(index) => index as i32,
+                                    None => {
+                                        texture_paths.push(texture_path);
+                                        texture_paths.len() as i32 - 1
+                                    }
+                                }
                             }
+                            None => -1,
                         }
                     } else {
                         -1
@@ -358,7 +365,7 @@ impl SceneModels {
                 } else {
                     bytemuck::cast_slice(&vertices)
                 },
-                usage: wgpu::BufferUsage::VERTEX | wgpu::BufferUsage::STORAGE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             }),
             index_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SceneModel IndexBuffer"),
@@ -367,7 +374,7 @@ impl SceneModels {
                 } else {
                     bytemuck::cast_slice(&indices)
                 },
-                usage: wgpu::BufferUsage::INDEX | wgpu::BufferUsage::STORAGE,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
             }),
             mesh_desc_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SceneModel Mesh Data"),
@@ -376,7 +383,7 @@ impl SceneModels {
                 } else {
                     bytemuck::cast_slice(&meshes_gpu)
                 },
-                usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             }),
             meshes,
             texture_views,

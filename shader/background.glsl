@@ -10,14 +10,12 @@ layout(set = 1, binding = 0) uniform BackgroundAndLighting {
 };
 layout(set = 1, binding = 1) uniform textureCube CubemapRgbe;
 
-vec3 decodeRGBE(vec4 hdr) { return hdr.rgb * exp2((hdr.a * 255.0) - 128.0); }
-
+// CubemapCpuLoader stores float HDR faces into Rgba8Unorm texels via linearRgb → gamma_rgb (approx. γ = 2.2), opaque alpha — not Radiance RGBE.
 vec3 sampleHdrCubemap(vec3 dir) {
-    // It seems that what we get out of https://github.com/Wumpf/hdr-cubemap-to-sh has swapped x and z.
-    // (light direction & SH directionality)
-    // Compensating this here by flipping the env map.
-    vec4 rgbe = texture(samplerCube(CubemapRgbe, SamplerTrilinearClamp), dir.zyx);
-    return decodeRGBE(rgbe);
+    // Orientation note: hdr-cubemap-to-sh swaps x/z relative to shader expectations; flipped sample direction.
+    vec4 tex = texture(samplerCube(CubemapRgbe, SamplerTrilinearClamp), dir.zyx);
+    vec3 gamma_rgb = saturate(tex.rgb);
+    return pow(gamma_rgb, vec3(2.2));
 }
 
 // Box filtered lines, by Inigo Quilez via https://www.shadertoy.com/view/XdBGzd

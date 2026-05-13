@@ -34,19 +34,57 @@ pub struct Background {
 }
 
 mod cubemap_loader {
-    use image::hdr::Rgbe8Pixel;
+    use image::ImageDecoder;
+    use image::codecs::hdr::HdrDecoder;
     use std::{
         fs::File,
         io::{Read, Write},
-        num::NonZeroU32,
         path::{Path, PathBuf},
     };
 
     const CUBEMAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-    const CUBEMAP_FORMAT_BYTES_PER_PIXEL: u32 = std::mem::size_of::<Rgbe8Pixel>() as u32;
 
     fn get_cache_filename(path: &Path) -> PathBuf {
-        path.join(format!(".raw_rgbe8_cubemap.cache"))
+        path.join(".raw_rgba8_cubemap.cache")
+    }
+
+    fn linear_rgb_to_gamma_rgba8(r: f32, g: f32, b: f32) -> [u8; 4] {
+        fn channel(x: f32) -> u8 {
+            let x = x.max(0.0).powf(1.0 / 2.2).min(1.0);
+            (x * 255.0).round() as u8
+        }
+        [channel(r), channel(g), channel(b), 255]
+    }
+
+    fn decode_hdr_face_rgba(reader: impl std::io::Read) -> Result<Vec<u8>, image::ImageError> {
+        let decoder = HdrDecoder::new(reader)?;
+        let dims = decoder.dimensions();
+        if dims.0 != dims.1 {
+            panic!("cubemap face width not equal height");
+        }
+        let mut linear = vec![0u8; decoder.total_bytes() as usize];
+        decoder.read_image(&mut linear)?;
+        let mut rgba = Vec::with_capacity(linear.len() / 3);
+        for px in linear.chunks_exact(12) {
+            let r = f32::from_ne_bytes(px[0..4].try_into().unwrap());
+            let g = f32::from_ne_bytes(px[4..8].try_into().unwrap());
+            let b = f32::from_ne_bytes(px[8..12].try_into().unwrap());
+            rgba.extend_from_slice(&linear_rgb_to_gamma_rgba8(r, g, b));
+        }
+        Ok(rgba)
+    }
+
+    /// Cache layout: 6 faces × (`resolution`²) RGBA8 texels (`4 × 6 × resolution²` bytes).
+    fn cube_face_resolution_from_raw_cache_len(bytes: usize) -> Option<u32> {
+        if bytes == 0 || bytes % (4 * 6) != 0 {
+            return None;
+        }
+        let pixels_per_face = bytes / 4 / 6;
+        let r = (pixels_per_face as f64).sqrt().round() as u64;
+        if r == 0 || r * r != pixels_per_face as u64 {
+            return None;
+        }
+        Some(r as u32)
     }
 
     fn from_cache(path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<wgpu::Texture, std::io::Error> {
@@ -54,9 +92,16 @@ mod cubemap_loader {
         info!("loading cubemap from cached raw file at {:?}", cache_filename);
 
         let mut image_data = Vec::new();
-        let num_bytes_read = File::open(cache_filename)?.read_to_end(&mut image_data).unwrap();
-
-        let resolution = f32::sqrt((num_bytes_read / 4 / 6) as f32) as u32;
+        File::open(&cache_filename)?.read_to_end(&mut image_data)?;
+        let Some(resolution) = cube_face_resolution_from_raw_cache_len(image_data.len()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cubemap cache has invalid size ({} bytes); expected 24 × (face resolution)²",
+                    image_data.len()
+                ),
+            ));
+        };
 
         let cubemap = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Cubemap"),
@@ -69,20 +114,22 @@ mod cubemap_loader {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: CUBEMAP_FORMAT,
-            usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[CUBEMAP_FORMAT],
         });
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &cubemap,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
             },
             &image_data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: NonZeroU32::new(CUBEMAP_FORMAT_BYTES_PER_PIXEL * resolution),
-                rows_per_image: NonZeroU32::new(resolution),
+                bytes_per_row: Some(4 * resolution),
+                rows_per_image: Some(resolution),
             },
             wgpu::Extent3d {
                 width: resolution,
@@ -94,7 +141,7 @@ mod cubemap_loader {
         Ok(cubemap)
     }
 
-    // Loads cubemap in rgbe format
+    // Loads cubemap from Radiance .hdr cube faces (decodes to gamma‑mapped RGBA8 for the RGBA8Unorm texture).
     fn from_hdr_faces(path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<wgpu::Texture, std::io::Error> {
         let filenames = ["px.hdr", "nx.hdr", "py.hdr", "ny.hdr", "pz.hdr", "nz.hdr"];
 
@@ -107,15 +154,15 @@ mod cubemap_loader {
             info!("loading cubemap face {}..", i);
 
             let file_reader = std::io::BufReader::new(File::open(path.join(filename))?);
-            let decoder = image::hdr::HdrDecoder::new(file_reader).unwrap();
-            let metadata = decoder.metadata();
+            let rgba = decode_hdr_face_rgba(file_reader).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?;
 
-            if metadata.height != metadata.width {
-                panic!("cubemap face width not equal height");
+            let face_res = ((rgba.len() / 4) as f64).sqrt() as u32;
+            if face_res as u64 * face_res as u64 * 4 != rgba.len() as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "hdr decode size mismatch"));
             }
 
-            if let &None = &cubemap {
-                resolution = metadata.width;
+            if cubemap.is_none() {
+                resolution = face_res;
                 cubemap = Some(device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Cubemap"),
                     size: wgpu::Extent3d {
@@ -127,30 +174,29 @@ mod cubemap_loader {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: CUBEMAP_FORMAT,
-                    usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[CUBEMAP_FORMAT],
                 }));
             }
 
-            if resolution != metadata.width {
+            if resolution != face_res {
                 panic!("all cubemap faces need to have the same resolution");
             }
 
-            let image_data = decoder.read_image_native().unwrap();
-            let image_data_raw =
-                unsafe { std::slice::from_raw_parts(image_data.as_ptr() as *const u8, image_data.len() * std::mem::size_of::<Rgbe8Pixel>()) };
-            cache_file.write_all(image_data_raw)?;
+            cache_file.write_all(&rgba)?;
 
             queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &cubemap.as_ref().unwrap(),
+                wgpu::TexelCopyTextureInfo {
+                    texture: cubemap.as_ref().unwrap(),
                     mip_level: 0,
                     origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                image_data_raw,
-                wgpu::ImageDataLayout {
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: NonZeroU32::new(CUBEMAP_FORMAT_BYTES_PER_PIXEL * resolution),
-                    rows_per_image: NonZeroU32::new(resolution),
+                    bytes_per_row: Some(4 * resolution),
+                    rows_per_image: Some(resolution),
                 },
                 wgpu::Extent3d {
                     width: resolution,
@@ -167,8 +213,13 @@ mod cubemap_loader {
         // Loading .hdr is somewhat slow, especially so in debug. So we cache the raw data.
         let cubemap = match from_cache(path, device, queue) {
             Ok(cubemap) => cubemap,
-            Err(_) => {
-                info!("no raw cubemap file, loading from .hdr faces instead");
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("no cubemap cache, loading from .hdr faces");
+                from_hdr_faces(path, device, queue)?
+            }
+            Err(e) => {
+                warn!("{}", e);
+                info!("loading cubemap from .hdr faces instead");
                 from_hdr_faces(path, device, queue)?
             }
         };
@@ -216,8 +267,8 @@ impl Background {
         let cubemap_view = cubemap_loader::load(path, device, queue)?;
 
         let bind_group_layout = BindGroupLayoutBuilder::new()
-            .next_binding(wgpu::ShaderStage::COMPUTE | wgpu::ShaderStage::FRAGMENT, binding_glsl::uniform())
-            .next_binding(wgpu::ShaderStage::COMPUTE | wgpu::ShaderStage::FRAGMENT, binding_glsl::textureCube())
+            .next_binding(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT, binding_glsl::uniform())
+            .next_binding(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT, binding_glsl::textureCube())
             .create(device, "BindGroupLayout: Lighting & Background");
 
         let bind_group = BindGroupBuilder::new(&bind_group_layout)
@@ -229,8 +280,8 @@ impl Background {
             "Cubemap Renderer",
             Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Cubemap Renderer Pipeline Layout"),
-                bind_group_layouts: &[&global_bind_group_layout, &bind_group_layout.layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(global_bind_group_layout), Some(&bind_group_layout.layout)],
+                immediate_size: 0,
             })),
             Path::new("screentri.vert"),
             Path::new("background_render.frag"),
@@ -239,8 +290,8 @@ impl Background {
         );
         render_pipeline_desc.depth_stencil = Some(wgpu::DepthStencilState {
             format: Screen::FORMAT_DEPTH,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: Default::default(),
             bias: Default::default(),
         });

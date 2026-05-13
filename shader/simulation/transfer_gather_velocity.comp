@@ -55,7 +55,7 @@ void main() {
     float velocityComponent = 0.0;
     float velocityWeight = 0.0;
 
-    uint localParticleIndex = imageLoad(LinkedListDualGrid, gridCoord).r - 1;
+    uint localParticleIndex = FluidDualGridCells.Cells[fluid_grid_cell_linear_index(gridCoord)] - 1;
 
     // A cell starts out with 8 particles, ideally that stays roughly constant.
     for (int i = 0; i < 12; ++i) {

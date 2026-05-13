@@ -23,5 +23,6 @@ void main() {
     ivec3 nearestDualGridCell = ivec3(position - offset);
 
     // Remember, indices in grid are offset by +1 for easy handling of empty cells.
-    Particles[particleIndex].LinkedListNext = imageAtomicExchange(LinkedListDualGrid, nearestDualGridCell, particleIndex + 1) - 1;
+    uint cellIndex = fluid_grid_cell_linear_index(nearestDualGridCell);
+    Particles[particleIndex].LinkedListNext = atomicExchange(FluidDualGridCells.Cells[cellIndex], particleIndex + 1) - 1;
 }

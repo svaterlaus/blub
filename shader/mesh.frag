@@ -16,7 +16,7 @@ void main() {
     vec3 albedo = vec3(1.0);
     int textureIndex = Meshes[MeshIndex].TextureIndex;
     if (textureIndex >= 0) {
-        albedo = texture(sampler2D(MeshTextures[textureIndex], SamplerTrilinearClamp), in_Texcoord).rgb;
+        albedo = texture(sampler2D(MeshTextureMain, SamplerTrilinearClamp), in_Texcoord).rgb;
     }
 
     vec3 brdf = albedo / PI;

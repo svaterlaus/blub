@@ -9,7 +9,7 @@ layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image3D SceneVo
 
 layout(location = 0) in flat uint in_SideIndex;
 
-layout(location = 0) out float out_Dummy;
+layout(location = 0) out vec4 out_Dummy;
 
 vec3 Unswizzle(vec3 v) { return in_SideIndex == 0 ? v.zyx : (in_SideIndex == 1 ? v.xzy : v.xyz); }
 vec3 UnswizzlePosAndClamp(vec3 pos) { return clamp(Unswizzle(pos), vec3(0), vec3(Rendering.FluidGridResolution) - vec3(1)); }
@@ -50,5 +50,5 @@ void main() {
         imageStore(SceneVoxelization, ivec3(voxelPos), vec4(ComputeVoxelSpeed(voxelPos), 1.0));
     }
 
-    out_Dummy = 0.0;
+    out_Dummy = vec4(0.0);
 }

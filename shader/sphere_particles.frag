@@ -9,9 +9,6 @@ layout(location = 2) in vec3 in_Tint;
 layout(location = 3) in float in_Radius;
 layout(location = 0) out vec4 out_Color;
 
-// Note that we promise to only lessen the depth value, so gpu can still do some hi-z/early depth culling
-layout(depth_less) out float gl_FragDepth;
-
 void main() {
     const vec3 lightdir = normalize(vec3(1.0, 2.0, 1.0));
 

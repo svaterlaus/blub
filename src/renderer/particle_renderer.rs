@@ -27,11 +27,8 @@ impl ParticleRenderer {
             "ParticleRenderer: Render particles",
             Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ParticleRenderer Pipeline Layout"),
-                bind_group_layouts: &[&global_bind_group_layout, &fluid_renderer_group_layout],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStage::VERTEX,
-                    range: 0..4,
-                }],
+                bind_group_layouts: &[Some(global_bind_group_layout), Some(fluid_renderer_group_layout)],
+                immediate_size: 4,
             })),
             Path::new("fluid_particles.vert"),
             Path::new("sphere_particles.frag"),
@@ -52,7 +49,7 @@ impl ParticleRenderer {
     ) {
         rpass.set_pipeline(pipeline_manager.get_render(&self.render_pipeline));
         rpass.set_bind_group(1, fluid.bind_group_renderer(), &[]);
-        rpass.set_push_constants(wgpu::ShaderStage::VERTEX, 0, bytemuck::cast_slice(&[mode as u32]));
+        rpass.set_immediates(0, bytemuck::cast_slice(&[mode as u32]));
         rpass.draw(0..4, 0..fluid.num_particles());
     }
 }

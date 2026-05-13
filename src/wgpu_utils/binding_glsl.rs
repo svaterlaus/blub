@@ -17,15 +17,24 @@ pub fn uniform() -> wgpu::BindingType {
 }
 
 pub fn sampler(filtering: bool) -> wgpu::BindingType {
-    wgpu::BindingType::Sampler {
-        filtering,
-        comparison: false,
-    }
+    wgpu::BindingType::Sampler(if filtering {
+        wgpu::SamplerBindingType::Filtering
+    } else {
+        wgpu::SamplerBindingType::NonFiltering
+    })
 }
 
 pub fn texture2D() -> wgpu::BindingType {
     wgpu::BindingType::Texture {
         sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        view_dimension: wgpu::TextureViewDimension::D2,
+        multisampled: false,
+    }
+}
+
+pub fn texture2D_non_filterable() -> wgpu::BindingType {
+    wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Float { filterable: false },
         view_dimension: wgpu::TextureViewDimension::D2,
         multisampled: false,
     }
@@ -58,6 +67,14 @@ pub fn utexture2D() -> wgpu::BindingType {
 pub fn texture3D() -> wgpu::BindingType {
     wgpu::BindingType::Texture {
         sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        view_dimension: wgpu::TextureViewDimension::D3,
+        multisampled: false,
+    }
+}
+
+pub fn texture3D_non_filterable() -> wgpu::BindingType {
+    wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Float { filterable: false },
         view_dimension: wgpu::TextureViewDimension::D3,
         multisampled: false,
     }

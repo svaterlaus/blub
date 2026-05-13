@@ -18,7 +18,7 @@ impl<Content: bytemuck::Pod> UniformBuffer<Content> {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("UniformBuffer: {}", Self::name())),
             size: std::mem::size_of::<Content>() as u64,
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -33,12 +33,12 @@ impl<Content: bytemuck::Pod> UniformBuffer<Content> {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("UniformBuffer: {}", Self::name())),
             size: std::mem::size_of::<Content>() as u64,
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
 
         let mapped_memory = buffer.slice(..);
-        mapped_memory.get_mapped_range_mut().clone_from_slice(bytemuck::bytes_of(initial_content));
+        mapped_memory.get_mapped_range_mut().copy_from_slice(bytemuck::bytes_of(initial_content));
         buffer.unmap();
 
         UniformBuffer {

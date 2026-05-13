@@ -25,11 +25,8 @@ impl MeshRenderer {
                 label: "MeshRenderer",
                 layout: Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("MeshRenderer Pipeline Layout"),
-                    bind_group_layouts: &[global_bind_group_layout, background_and_lighting_group_layout],
-                    push_constant_ranges: &[wgpu::PushConstantRange {
-                        stages: wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-                        range: 0..4,
-                    }],
+                    bind_group_layouts: &[Some(global_bind_group_layout), Some(background_and_lighting_group_layout)],
+                    immediate_size: 4,
                 })),
                 vertex: VertexStateCreationDesc {
                     shader_relative_path: PathBuf::from("mesh.vert"),
@@ -65,11 +62,7 @@ impl MeshRenderer {
         rpass.set_vertex_buffer(0, scene_models.vertex_buffer.slice(..));
 
         for (i, mesh) in scene_models.meshes.iter().enumerate() {
-            rpass.set_push_constants(
-                wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-                0,
-                bytemuck::cast_slice(&[i as u32]),
-            );
+            rpass.set_immediates(0, bytemuck::cast_slice(&[i as u32]));
             rpass.draw_indexed(mesh.index_buffer_range.clone(), mesh.vertex_buffer_range.start as i32, 0..1);
         }
     }

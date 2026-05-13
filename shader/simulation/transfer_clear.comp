@@ -8,7 +8,7 @@
 COMPUTE_PASS_VOLUME
 
 void main() {
-    imageStore(LinkedListDualGrid, ivec3(gl_GlobalInvocationID), uvec4(0));
+    FluidDualGridCells.Cells[fluid_grid_cell_linear_index(ivec3(gl_GlobalInvocationID))] = 0u;
     if (VelocityTransferComponent == 0) {
         imageStore(MarkerVolume, ivec3(gl_GlobalInvocationID), vec4(CELL_AIR));
     }

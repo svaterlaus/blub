@@ -30,13 +30,14 @@ impl SceneVoxelization {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: Self::FORMAT,
-            usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[Self::FORMAT],
         });
         let volume_view = volume.create_view(&Default::default());
 
         let group_layout = BindGroupLayoutBuilder::new()
             .next_binding(
-                wgpu::ShaderStage::COMPUTE | wgpu::ShaderStage::FRAGMENT,
+                wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
                 binding_glsl::image3D(Self::FORMAT, wgpu::StorageTextureAccess::WriteOnly),
             )
             .create(device, "BindGroupLayout: Voxelization");
@@ -52,11 +53,8 @@ impl SceneVoxelization {
                 label: "Voxelize Mesh",
                 layout: Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("Voxelize Mesh Pipeline Layout"),
-                    bind_group_layouts: &[&global_bind_group_layout, &group_layout.layout],
-                    push_constant_ranges: &[wgpu::PushConstantRange {
-                        stages: wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-                        range: 0..4,
-                    }],
+                    bind_group_layouts: &[Some(global_bind_group_layout), Some(&group_layout.layout)],
+                    immediate_size: 4,
                 })),
                 vertex: VertexStateCreationDesc {
                     shader_relative_path: "voxelize/conservative_hull.vert".into(),
@@ -75,7 +73,7 @@ impl SceneVoxelization {
                     targets: vec![wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
                         blend: None,
-                        write_mask: wgpu::ColorWrite::empty(),
+                        write_mask: wgpu::ColorWrites::empty(),
                     }],
                 },
             },
@@ -96,7 +94,8 @@ impl SceneVoxelization {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
             })
             .create_view(&Default::default());
 
@@ -127,31 +126,31 @@ impl SceneVoxelization {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Voxelize"),
             // Needed until https://github.com/gpuweb/gpuweb/issues/503 is resolved
-            color_attachments: &[wgpu::RenderPassColorAttachment {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.dummy_render_target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
-                    store: false,
+                    store: wgpu::StoreOp::Discard,
                 },
-            }],
+            })],
             depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         rpass.set_viewport(0.0, 0.0, self.viewport_extent as f32, self.viewport_extent as f32, 0.0, 1.0);
         rpass.set_pipeline(pipeline_manager.get_render(&self.pipeline_conservative_hull));
-        rpass.set_bind_group(0, &global_bind_group, &[]);
+        rpass.set_bind_group(0, global_bind_group, &[]);
         rpass.set_bind_group(1, &self.bind_group, &[]);
 
         // Use programmable vertex fetching since for every triangle we want to decide independently which direction to use for rendering.
         // (i.e. we may need to duplicate vertices that are otherwise shared with triangles)
 
         for (i, mesh) in scene_models.meshes.iter().enumerate() {
-            rpass.set_push_constants(
-                wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-                0,
-                bytemuck::cast_slice(&[i as u32]),
-            );
+            rpass.set_immediates(0, bytemuck::cast_slice(&[i as u32]));
             rpass.draw(mesh.index_buffer_range.clone(), 0..1);
         }
     }

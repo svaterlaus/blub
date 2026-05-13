@@ -11,7 +11,6 @@
 #endif
 
 layout(location = 0) out vec4 out_Color;
-layout(depth_less) out float gl_FragDepth;
 
 void main() {
     // Too lazy to do this cleaner, also doesn't matter perf wise :)

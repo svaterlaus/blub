@@ -1,3 +1,14 @@
+/// Stand-in for the old `wgpu_profiler` crate macro (wgpu-profiler ≥0.9 uses scopes instead).
+#[macro_export]
+macro_rules! wgpu_profiler {
+    ($label:expr, $profiler:expr, $rec:expr, $device:expr, $body:block) => {
+        $body
+    };
+    ($label:expr, $profiler:expr, $rec:expr, $device:expr, (|| $closure_body:block)()) => {
+        (|| $closure_body)()
+    };
+}
+
 pub mod binding_builder;
 #[allow(dead_code)]
 #[allow(non_snake_case)]

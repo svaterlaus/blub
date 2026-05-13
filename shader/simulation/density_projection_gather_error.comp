@@ -11,7 +11,7 @@
 #include "particles.glsl"
 
 layout(set = 2, binding = 0) buffer restrict readonly ParticlePositionLlBuffer { ParticlePositionLl Particles[]; };
-layout(set = 2, binding = 1) uniform utexture3D LinkedListDualGrid;
+layout(set = 2, binding = 1, std430) buffer restrict readonly FluidDualGridCells_ { uint Cells[]; } FluidDualGridCells;
 layout(set = 2, binding = 2, r8_snorm) uniform restrict image3D MarkerVolume;
 layout(set = 2, binding = 3, r32f) uniform restrict image3D DensityVolume;
 layout(set = 2, binding = 4) uniform utexture3D SolidPenetrationDepth;
@@ -49,7 +49,7 @@ void main() {
 
     vec3 samplePosition = vec3(gridCoord) + vec3(0.5);
 
-    uint localParticleIndex = texelFetch(LinkedListDualGrid, gridCoord, 0).r - 1;
+    uint localParticleIndex = FluidDualGridCells.Cells[fluid_grid_cell_linear_index(gridCoord)] - 1;
 
     float density = 0.0;
 
@@ -60,7 +60,7 @@ void main() {
     //         ++numParticles;
     //         localParticleIndex = Particles[localParticleIndex].LinkedListNext;
     //     }
-    //     localParticleIndex = texelFetch(LinkedListDualGrid, gridCoord, 0).r - 1;
+    //     localParticleIndex = FluidDualGridCells.Cells[fluid_grid_cell_linear_index(gridCoord)] - 1;
     //     imageStore(DebugVolume, gridCoord, vec4(numParticles / 8.0));
     // }
 

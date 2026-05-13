@@ -42,8 +42,8 @@ impl StaticLineRenderer {
             "Line Renderer",
             Rc::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Static Line Renderer Pipeline Layout"),
-                bind_group_layouts: &[&global_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(global_bind_group_layout)],
+                immediate_size: 0,
             })),
             Path::new("lines.vert"),
             Path::new("vertex_color.frag"),
@@ -53,7 +53,7 @@ impl StaticLineRenderer {
         render_pipeline_desc.primitive.topology = wgpu::PrimitiveTopology::LineList;
         render_pipeline_desc.vertex.buffers = vec![wgpu::VertexBufferLayout {
             array_stride: LINE_VERTEX_SIZE as wgpu::BufferAddress,
-            step_mode: wgpu::InputStepMode::Vertex,
+            step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
@@ -73,7 +73,7 @@ impl StaticLineRenderer {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("StaticLineRenderer VertexBuffer"),
             size: (max_num_lines * LINE_VERTEX_SIZE * 2) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsage::VERTEX | wgpu::BufferUsage::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 

@@ -38,7 +38,11 @@ impl HdrBackbuffer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: Self::FORMAT,
-            usage: wgpu::TextureUsage::RENDER_ATTACHMENT | wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::STORAGE | wgpu::TextureUsage::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[Self::FORMAT],
         });
         let hdr_backbuffer_view = hdr_backbuffer.create_view(&Default::default());
 
@@ -47,8 +51,8 @@ impl HdrBackbuffer {
             .create(device, "BindGroupLayout: Screen, Read Texture");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("HdrBackbuffer Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout.layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout.layout)],
+            immediate_size: 0,
         });
         let read_backbuffer_bind_group = BindGroupBuilder::new(&bind_group_layout)
             .texture(&hdr_backbuffer_view)
@@ -94,15 +98,19 @@ impl HdrBackbuffer {
         // Note that we can't use a compute shader here since that would require STORAGE usage flag on the final output which we can't do since it's srgb!
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("tonemap"),
-            color_attachments: &[wgpu::RenderPassColorAttachment {
-                view: &target,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: true,
+                    store: wgpu::StoreOp::Store,
                 },
-            }],
+            })],
             depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
         render_pass.set_pipeline(pipeline_manager.get_render(&self.hdr_resolve_pipeline));
         render_pass.set_bind_group(0, &self.read_backbuffer_bind_group, &[]);

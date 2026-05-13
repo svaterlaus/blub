@@ -10,8 +10,6 @@ pub struct GlobalBindings {
 }
 
 impl GlobalBindings {
-    pub const NUM_MESH_TEXTURES: u32 = 1;
-
     pub fn new(device: &wgpu::Device) -> Self {
         let bind_group_layout = BindGroupLayoutBuilder::new()
             // Constants
@@ -21,17 +19,12 @@ impl GlobalBindings {
             .next_binding_all(binding_glsl::sampler(false))
             // Meshdata
             .next_binding(
-                wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT | wgpu::ShaderStage::COMPUTE,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 binding_glsl::buffer(true),
             )
-            .binding(wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStage::FRAGMENT,
-                ty: binding_glsl::texture2D(),
-                count: std::num::NonZeroU32::new(Self::NUM_MESH_TEXTURES),
-            })
-            .next_binding(wgpu::ShaderStage::COMPUTE | wgpu::ShaderStage::VERTEX, binding_glsl::buffer(true))
-            .next_binding(wgpu::ShaderStage::COMPUTE | wgpu::ShaderStage::VERTEX, binding_glsl::buffer(true))
+            .next_binding_fragment(binding_glsl::texture2D())
+            .next_binding(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX, binding_glsl::buffer(true))
+            .next_binding(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX, binding_glsl::buffer(true))
             .create(device, "BindGroupLayout: GlobalBindings");
 
         GlobalBindings {
@@ -48,7 +41,7 @@ impl GlobalBindings {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let point_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -58,7 +51,7 @@ impl GlobalBindings {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -74,15 +67,15 @@ impl GlobalBindings {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsage::SAMPLED,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
             })
             .create_view(&Default::default());
 
-        let texture_views: Vec<&wgpu::TextureView> = meshes
+        let mesh_albedo_texture = meshes
             .texture_views
-            .iter()
-            .chain(std::iter::repeat(&dummy_texture_view).take(Self::NUM_MESH_TEXTURES as usize - meshes.texture_views.len()))
-            .collect();
+            .first()
+            .unwrap_or(&dummy_texture_view);
 
         self.bind_group = Some(
             BindGroupBuilder::new(&self.bind_group_layout)
@@ -93,7 +86,7 @@ impl GlobalBindings {
                 .sampler(&point_sampler)
                 // Meshdata
                 .resource(meshes.mesh_desc_buffer.as_entire_binding())
-                .resource(wgpu::BindingResource::TextureViewArray(&texture_views))
+                .texture(mesh_albedo_texture)
                 .resource(meshes.index_buffer.as_entire_binding())
                 .resource(meshes.vertex_buffer.as_entire_binding())
                 .create(device, "BindGroup: GlobalBindings"),

@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 use strum::IntoEnumIterator;
-use wgpu_profiler::GpuTimerScopeResult;
+use egui_wgpu::{Renderer as EguiWgpuRenderer, RendererOptions, ScreenDescriptor};
+use egui_winit::State as EguiWinitState;
+use wgpu_profiler::GpuTimerQueryResult;
 use winit::event_loop::EventLoopProxy;
 
 mod custom_widgets;
@@ -44,23 +46,19 @@ pub struct GUIState {
     known_scene_files: Vec<PathBuf>,
     wait_for_vblank: bool,
 
-    profiling_data_rendering: Vec<GpuTimerScopeResult>,
-    profiling_data_simulation: Vec<GpuTimerScopeResult>,
+    profiling_data_rendering: Vec<GpuTimerQueryResult>,
+    profiling_data_simulation: Vec<GpuTimerQueryResult>,
 
     show_profiling_data_rendering: bool,
     show_profiling_data_simulation: bool,
 }
 
 pub struct GUI {
-    platform: egui_winit_platform::Platform,
-    render_pass: egui_wgpu_backend::RenderPass,
+    egui_ctx: egui::Context,
+    egui_winit: EguiWinitState,
+    egui_wgpu: EguiWgpuRenderer,
 
     state: GUIState,
-}
-
-struct DummyRepaintSignal;
-impl epi::RepaintSignal for DummyRepaintSignal {
-    fn request_repaint(&self) {}
 }
 
 impl GUI {
@@ -68,19 +66,26 @@ impl GUI {
         let mut style = egui::Style::default();
         style.visuals.code_bg_color = egui::Color32::from_rgb(64, 64, 100);
 
-        let platform = egui_winit_platform::Platform::new(egui_winit_platform::PlatformDescriptor {
-            physical_width: window.inner_size().width as u32,
-            physical_height: window.inner_size().height as u32,
-            scale_factor: window.scale_factor(),
-            font_definitions: egui::FontDefinitions::default(),
-            style,
+        let egui_ctx = egui::Context::default();
+
+        egui_ctx.global_style_mut(|s| {
+            *s = style.clone();
         });
 
-        let render_pass = egui_wgpu_backend::RenderPass::new(device, Screen::FORMAT_BACKBUFFER, 1);
+        let egui_wgpu = EguiWgpuRenderer::new(device, Screen::FORMAT_BACKBUFFER, RendererOptions::default());
+        let egui_winit = EguiWinitState::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(device.limits().max_texture_dimension_2d as usize),
+        );
 
         GUI {
-            platform,
-            render_pass,
+            egui_ctx,
+            egui_winit,
+            egui_wgpu,
             state: GUIState {
                 fast_forward_length_seconds: 5.0,
                 video_fps: 60,
@@ -96,8 +101,8 @@ impl GUI {
         }
     }
 
-    pub fn handle_event<T>(&mut self, winit_event: &winit::event::Event<T>) {
-        self.platform.handle_event(winit_event);
+    pub fn on_window_event(&mut self, window: &winit::window::Window, event: &winit::event::WindowEvent) -> egui_winit::EventResponse {
+        self.egui_winit.on_window_event(window, event)
     }
 
     pub fn selected_scene(&self) -> &PathBuf {
@@ -110,14 +115,11 @@ impl GUI {
         simulation_controller: &SimulationController,
         event_loop_proxy: &EventLoopProxy<ApplicationEvent>,
     ) {
-        ui.add(
-            egui::Label::new(format!(
-                "{:3.2}ms, FPS: {:3.2}",
-                simulation_controller.timer().duration_last_frame().as_secs_f64() * 1000.0,
-                1000.0 / 1000.0 / simulation_controller.timer().duration_last_frame().as_secs_f64()
-            ))
-            .heading(),
-        );
+        ui.heading(format!(
+            "{:3.2}ms, FPS: {:3.2}",
+            simulation_controller.timer().duration_last_frame().as_secs_f64() * 1000.0,
+            1000.0 / 1000.0 / simulation_controller.timer().duration_last_frame().as_secs_f64()
+        ));
 
         let frame_times = simulation_controller
             .timer()
@@ -127,7 +129,7 @@ impl GUI {
             .collect::<Vec<f32>>();
         custom_widgets::plot_barchart(
             ui,
-            egui::vec2(ui.available_size_before_wrap_finite().x, 40.0),
+            egui::vec2(ui.available_size_before_wrap().x, 40.0),
             &frame_times,
             frame_times.iter().cloned().fold(0.0, f32::max),
             "ms",
@@ -145,32 +147,32 @@ impl GUI {
 
         ui.horizontal(|ui| {
             ui.label("num simulation steps current frame:");
-            ui.add(
-                egui::Label::new(format!(
-                    "{}",
-                    simulation_controller.timer().num_simulation_steps_performed_for_current_frame()
-                ))
-                .strong(),
-            );
+            ui.strong(format!(
+                "{}",
+                simulation_controller.timer().num_simulation_steps_performed_for_current_frame()
+            ));
         });
 
         egui::Grid::new("timers").show(ui, |ui| {
             if let SimulationControllerStatus::RecordingWithFixedFrameLength { .. } = simulation_controller.status() {
                 ui.colored_label(
                     egui::Color32::RED,
-                    egui::Label::new(format!(
+                    format!(
                         "OFFLINE RECORDING ({:.2}fps)",
                         1.0 / simulation_controller.timer().frame_delta().as_secs_f64()
-                    )),
+                    ),
                 );
             } else {
                 ui.label("rendered time:");
-                ui.add(egui::Label::new(format!("{:.2}", simulation_controller.timer().total_render_time().as_secs_f64())).strong());
+                ui.strong(format!(
+                    "{:.2}",
+                    simulation_controller.timer().total_render_time().as_secs_f64()
+                ));
             }
             ui.end_row();
 
             ui.label("simulated time:");
-            ui.label(egui::Label::new(format!("{:.2}", simulation_controller.timer().total_simulated_time().as_secs_f64())).strong());
+            ui.strong(format!("{:.2}", simulation_controller.timer().total_simulated_time().as_secs_f64()));
         });
     }
 
@@ -189,7 +191,7 @@ impl GUI {
                 4,
             );
             ui.vertical(|ui| {
-                ui.add(egui::Label::new("max residual error").wrap(false));
+                ui.add(egui::Label::new("max residual error").extend());
                 ui.label(format!("{}", newest_sample.error));
             });
         });
@@ -203,7 +205,7 @@ impl GUI {
                 0,
             );
             ui.vertical(|ui| {
-                ui.add(egui::Label::new("# solver iterations").wrap(false));
+                ui.add(egui::Label::new("# solver iterations").extend());
                 ui.label(format!("{}", newest_sample.iteration_count));
             });
         });
@@ -273,7 +275,7 @@ impl GUI {
 
         ui.horizontal(|ui| {
             ui.label("total num simulation steps:");
-            ui.add(egui::Label::new(format!("{}", simulation_controller.timer().num_simulation_steps_performed())).strong());
+            ui.strong(format!("{}", simulation_controller.timer().num_simulation_steps_performed()));
         });
 
         ui.separator();
@@ -347,11 +349,11 @@ impl GUI {
         ui.horizontal(|ui| {
             ui.label("volume resolution:");
             let grid_dim = scene.config().fluid.grid_dimension;
-            ui.add(egui::Label::new(format!("{}x{}x{}", grid_dim.x, grid_dim.y, grid_dim.z)).strong());
+            ui.strong(format!("{}x{}x{}", grid_dim.x, grid_dim.y, grid_dim.z));
         });
         ui.horizontal(|ui| {
             ui.label("num particles:");
-            ui.add(egui::Label::new(format!("{}", scene.num_active_particles())).strong());
+            ui.strong(format!("{}", scene.num_active_particles()));
         });
         ui.separator();
         egui::ComboBox::from_label("Scene Selection")
@@ -419,10 +421,14 @@ impl GUI {
         ui.checkbox(&mut scene_renderer.enable_box_lines, "Show Fluid Domain Bounds");
     }
 
-    fn setup_ui_profiler(ui: &mut egui::Ui, profiling_data: &Vec<GpuTimerScopeResult>, levels_default_open: i32) {
+    fn setup_ui_profiler(ui: &mut egui::Ui, profiling_data: &[GpuTimerQueryResult], levels_default_open: i32) {
         for scope in profiling_data.iter() {
-            let time = format!("{:.3}ms", (scope.time.end - scope.time.start) * 1000.0);
-            if scope.nested_scopes.is_empty() {
+            let time = scope
+                .time
+                .as_ref()
+                .map(|t| format!("{:.3}ms", (t.end - t.start) * 1000.0))
+                .unwrap_or_else(|| "—".to_owned());
+            if scope.nested_queries.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(&scope.label);
                     ui.with_layout(egui::Layout::default().with_cross_align(egui::Align::Max), |ui| {
@@ -433,7 +439,7 @@ impl GUI {
                 egui::CollapsingHeader::new(format!("{}  -  {}", scope.label, time))
                     .id_source(&scope.label)
                     .default_open(levels_default_open > 0)
-                    .show(ui, |ui| Self::setup_ui_profiler(ui, &scope.nested_scopes, levels_default_open - 1));
+                    .show(ui, |ui| Self::setup_ui_profiler(ui, &scope.nested_queries, levels_default_open - 1));
             }
             ui.end_row();
         }
@@ -441,104 +447,129 @@ impl GUI {
 
     pub fn draw(
         &mut self,
-        device: &mut wgpu::Device,
+        device: &wgpu::Device,
         window: &winit::window::Window,
         encoder: &mut wgpu::CommandEncoder,
-        queue: &mut wgpu::Queue,
+        queue: &wgpu::Queue,
         view: &wgpu::TextureView,
         simulation_controller: &mut SimulationController,
         scene_renderer: &mut SceneRenderer,
         scene: &mut Scene,
         event_loop_proxy: &EventLoopProxy<ApplicationEvent>,
     ) {
-        self.platform.begin_frame();
+        let raw_input = self.egui_winit.take_egui_input(window);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            egui::Window::new("Blub")
+                .default_size([340.0, 700.0])
+                .resizable(true)
+                .scroll([true, true])
+                .title_bar(false)
+                .show(ctx, |ui| {
+                    Self::setup_ui_timer(ui, &mut self.state, simulation_controller, event_loop_proxy);
 
-        // Draw gui
-        egui::Window::new("Blub")
-            .default_size([340.0, 700.0])
-            .resizable(true)
-            .scroll(true)
-            .title_bar(false)
-            .show(&self.platform.context(), |ui| {
-                Self::setup_ui_timer(ui, &mut self.state, simulation_controller, event_loop_proxy);
-
-                egui::CollapsingHeader::new("Solver").show(ui, |ui| {
-                    Self::setup_ui_solver(ui, scene.fluid_mut());
-                    ui.separator();
-                    ui.add(
-                        egui::Slider::new(&mut scene.fluid_mut().dynamic_settings().particle_rebinning_step_frequency, 0..=300)
-                            .text("particle binning frequency"),
-                    );
-                });
-                egui::CollapsingHeader::new("Simulation Controller & Recording")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Self::setup_ui_simulation_control(ui, &mut self.state, simulation_controller, event_loop_proxy);
+                    egui::CollapsingHeader::new("Solver").show(ui, |ui| {
+                        Self::setup_ui_solver(ui, scene.fluid_mut());
+                        ui.separator();
+                        ui.add(
+                            egui::Slider::new(&mut scene.fluid_mut().dynamic_settings().particle_rebinning_step_frequency, 0..=300)
+                                .text("particle binning frequency"),
+                        );
                     });
-                egui::CollapsingHeader::new("Scene Settings").default_open(true).show(ui, |ui| {
-                    Self::setup_ui_scene_settings(ui, &mut self.state, scene, event_loop_proxy);
+                    egui::CollapsingHeader::new("Simulation Controller & Recording")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            Self::setup_ui_simulation_control(ui, &mut self.state, simulation_controller, event_loop_proxy);
+                        });
+                    egui::CollapsingHeader::new("Scene Settings").default_open(true).show(ui, |ui| {
+                        Self::setup_ui_scene_settings(ui, &mut self.state, scene, event_loop_proxy);
+                    });
+                    egui::CollapsingHeader::new("Rendering Settings").default_open(true).show(ui, |ui| {
+                        Self::setup_ui_render_settings(ui, scene_renderer);
+                    });
+                    if let Some(_) = egui::CollapsingHeader::new("Profiler - Single Simulation Frame")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if ui.button("Write Chrometrace").clicked() {
+                                let filename = Path::new("simulation-trace.json");
+                                info!("Writing chrome trace file to {:?}", filename);
+                                wgpu_profiler::chrometrace::write_chrometrace(filename, &self.state.profiling_data_simulation)
+                                    .expect("Failed to write chrometrace");
+                            }
+                            Self::setup_ui_profiler(ui, &self.state.profiling_data_simulation, 2);
+                        })
+                        .body_returned
+                    {
+                        self.state.show_profiling_data_simulation = true;
+                    } else {
+                        self.state.show_profiling_data_simulation = false;
+                    }
+                    if let Some(_) = egui::CollapsingHeader::new("Profiler - Rendering")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if ui.button("Write Chrometrace").clicked() {
+                                let filename = Path::new("rendering-trace.json");
+                                info!("Writing chrome trace file to {:?}", filename);
+                                wgpu_profiler::chrometrace::write_chrometrace(filename, &self.state.profiling_data_rendering)
+                                    .expect("Failed to write chrometrace");
+                            }
+                            Self::setup_ui_profiler(ui, &self.state.profiling_data_rendering, 4);
+                        })
+                        .body_returned
+                    {
+                        self.state.show_profiling_data_rendering = true;
+                    } else {
+                        self.state.show_profiling_data_rendering = false;
+                    }
                 });
-                egui::CollapsingHeader::new("Rendering Settings").default_open(true).show(ui, |ui| {
-                    Self::setup_ui_render_settings(ui, scene_renderer);
-                });
-                if let Some(_) = egui::CollapsingHeader::new("Profiler - Single Simulation Frame")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if ui.button("Write Chrometrace").clicked() {
-                            let filename = Path::new("simulation-trace.json");
-                            info!("Writing chrome trace file to {:?}", filename);
-                            wgpu_profiler::chrometrace::write_chrometrace(filename, &self.state.profiling_data_simulation)
-                                .expect("Failed to write chrometrace");
-                        }
-                        Self::setup_ui_profiler(ui, &self.state.profiling_data_simulation, 2);
-                    })
-                    .body_returned
-                {
-                    self.state.show_profiling_data_simulation = true;
-                } else {
-                    self.state.show_profiling_data_simulation = false;
-                }
-                if let Some(_) = egui::CollapsingHeader::new("Profiler - Rendering")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if ui.button("Write Chrometrace").clicked() {
-                            let filename = Path::new("rendering-trace.json");
-                            info!("Writing chrome trace file to {:?}", filename);
-                            wgpu_profiler::chrometrace::write_chrometrace(filename, &self.state.profiling_data_rendering)
-                                .expect("Failed to write chrometrace");
-                        }
-                        Self::setup_ui_profiler(ui, &self.state.profiling_data_rendering, 4);
-                    })
-                    .body_returned
-                {
-                    self.state.show_profiling_data_rendering = true;
-                } else {
-                    self.state.show_profiling_data_rendering = false;
-                }
-            });
+        });
 
-        // End the UI frame.
-        let (_output, paint_commands) = self.platform.end_frame();
-        let paint_jobs = self.platform.context().tessellate(paint_commands);
+        self.egui_winit.handle_platform_output(window, full_output.platform_output);
 
-        // Upload all resources for the GPU.
-        let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
-            physical_width: window.inner_size().width,
-            physical_height: window.inner_size().height,
-            scale_factor: window.scale_factor() as f32,
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_wgpu.update_texture(device, queue, *id, image_delta);
+        }
+
+        let jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [window.inner_size().width.max(1), window.inner_size().height.max(1)],
+            pixels_per_point: window.scale_factor() as f32,
         };
-        self.render_pass.update_texture(device, queue, &self.platform.context().texture());
-        self.render_pass.update_user_textures(device, queue);
-        self.render_pass.update_buffers(device, queue, &paint_jobs, &screen_descriptor);
 
-        // Record all render passes.
-        self.render_pass.execute(encoder, view, &paint_jobs, &screen_descriptor, None);
+        let callback_buffers = self.egui_wgpu.update_buffers(device, queue, encoder, &jobs, &screen_descriptor);
+        if !callback_buffers.is_empty() {
+            queue.submit(callback_buffers);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.egui_wgpu.render(&mut pass.forget_lifetime(), &jobs, &screen_descriptor);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.egui_wgpu.free_texture(id);
+        }
     }
 
-    pub fn report_profiling_data_rendering(&mut self, profiling_data_rendering: Vec<GpuTimerScopeResult>) {
+    pub fn report_profiling_data_rendering(&mut self, profiling_data_rendering: Vec<GpuTimerQueryResult>) {
         self.state.profiling_data_rendering = profiling_data_rendering;
     }
-    pub fn report_profiling_data_simulation(&mut self, profiling_data_simulation: Vec<GpuTimerScopeResult>) {
+    pub fn report_profiling_data_simulation(&mut self, profiling_data_simulation: Vec<GpuTimerQueryResult>) {
         self.state.profiling_data_simulation = profiling_data_simulation;
     }
     pub fn show_profiling_data_simulation(&self) -> bool {

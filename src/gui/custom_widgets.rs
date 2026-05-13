@@ -1,3 +1,4 @@
+use egui::epaint::{RectShape, StrokeKind};
 use egui::*;
 
 pub fn plot_barchart(
@@ -5,18 +6,19 @@ pub fn plot_barchart(
     size: Vec2,
     values: &[f32],
     top_value: f32,
-    value_unit: &'static str,
-    value_decimals: usize,
+    _value_unit: &'static str,
+    _value_decimals: usize,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_at_least(size, Sense::hover());
     let style = ui.style().noninteractive();
 
-    let mut shapes = vec![Shape::Rect {
+    let mut shapes = vec![Shape::Rect(RectShape::new(
         rect,
-        corner_radius: style.corner_radius,
-        fill: ui.visuals().extreme_bg_color,
-        stroke: ui.style().noninteractive().bg_stroke,
-    }];
+        style.corner_radius,
+        ui.visuals().extreme_bg_color,
+        style.bg_stroke,
+        StrokeKind::Outside,
+    ))];
 
     let rect = rect.shrink(4.0);
     let half_bar_width = rect.width() / values.len() as f32 * 0.5;
@@ -31,37 +33,13 @@ pub fn plot_barchart(
             max: pos2(x_max, rect.bottom()),
         };
 
-        let mut fill_color = ui.visuals().weak_text_color();
-
-        let tooltip = if let Some(pointer_pos) = ui.input().pointer.interact_pos() {
-            if bar.contains(pointer_pos) {
-                fill_color = ui.visuals().text_color();
-                Some(Shape::text(
-                    ui.fonts(),
-                    pointer_pos,
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("{:.*} {}", value_decimals, value, value_unit),
-                    TextStyle::Body,
-                    ui.visuals().strong_text_color(),
-                ))
-            } else {
-                None
-            }
+        let fill_color = if ui.rect_contains_pointer(bar) {
+            ui.visuals().text_color()
         } else {
-            None
+            ui.visuals().weak_text_color()
         };
 
-        shapes.push(Shape::Rect {
-            rect: bar,
-            corner_radius: 0.0,
-            fill: fill_color,
-            stroke: Default::default(),
-        });
-
-        // tooltip.
-        if let Some(tooltip) = tooltip {
-            shapes.push(tooltip);
-        }
+        shapes.push(Shape::Rect(RectShape::filled(bar, CornerRadius::ZERO, fill_color)));
     }
 
     ui.painter().extend(shapes);

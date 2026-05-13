@@ -31,7 +31,9 @@ impl ComputePipelineCreationDesc {
                 label: Some(self.label),
                 layout: Some(&self.layout),
                 module: &shader.module,
-                entry_point: SHADER_ENTRY_POINT_NAME,
+                entry_point: Some(SHADER_ENTRY_POINT_NAME),
+                compilation_options: Default::default(),
+                cache: None,
             }),
             shader_sources: shader.source_files,
         })
@@ -106,12 +108,15 @@ impl RenderPipelineCreationDesc {
         let shader_vs = shader_dir.load_shader_module(device, &self.vertex.shader_relative_path)?;
         let mut shader_fs = shader_dir.load_shader_module(device, &self.fragment.shader_relative_path)?;
 
+        let fragment_targets: Vec<Option<wgpu::ColorTargetState>> = self.fragment.targets.iter().cloned().map(Some).collect();
+
         let render_pipeline_descriptor = wgpu::RenderPipelineDescriptor {
             label: Some(self.label),
             layout: Some(&self.layout),
             vertex: wgpu::VertexState {
                 module: &shader_vs.module,
-                entry_point: SHADER_ENTRY_POINT_NAME,
+                entry_point: Some(SHADER_ENTRY_POINT_NAME),
+                compilation_options: Default::default(),
                 buffers: &self.vertex.buffers,
             },
             primitive: self.primitive.clone(),
@@ -119,9 +124,12 @@ impl RenderPipelineCreationDesc {
             multisample: self.multisample.clone(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader_fs.module,
-                entry_point: SHADER_ENTRY_POINT_NAME,
-                targets: &self.fragment.targets,
+                entry_point: Some(SHADER_ENTRY_POINT_NAME),
+                compilation_options: Default::default(),
+                targets: &fragment_targets,
             }),
+            multiview_mask: None,
+            cache: None,
         };
 
         let mut shader_sources = shader_vs.source_files;
@@ -269,8 +277,8 @@ pub mod depth_state {
     pub fn default_read_write(format: wgpu::TextureFormat) -> wgpu::DepthStencilState {
         wgpu::DepthStencilState {
             format,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }

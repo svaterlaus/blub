@@ -22,7 +22,7 @@ impl BindGroupLayoutBuilder {
         self
     }
 
-    pub fn next_binding(self, visibility: wgpu::ShaderStage, ty: wgpu::BindingType) -> Self {
+    pub fn next_binding(self, visibility: wgpu::ShaderStages, ty: wgpu::BindingType) -> Self {
         let binding = self.next_binding_index;
         self.binding(wgpu::BindGroupLayoutEntry {
             binding,
@@ -33,23 +33,23 @@ impl BindGroupLayoutBuilder {
     }
 
     pub fn next_binding_compute(self, ty: wgpu::BindingType) -> Self {
-        self.next_binding(wgpu::ShaderStage::COMPUTE, ty)
+        self.next_binding(wgpu::ShaderStages::COMPUTE, ty)
     }
 
     pub fn next_binding_fragment(self, ty: wgpu::BindingType) -> Self {
-        self.next_binding(wgpu::ShaderStage::FRAGMENT, ty)
+        self.next_binding(wgpu::ShaderStages::FRAGMENT, ty)
     }
 
     pub fn next_binding_vertex(self, ty: wgpu::BindingType) -> Self {
-        self.next_binding(wgpu::ShaderStage::VERTEX, ty)
+        self.next_binding(wgpu::ShaderStages::VERTEX, ty)
     }
 
     //pub fn next_binding_rendering(self, ty: wgpu::BindingType) -> Self {
-    //    self.next_binding(wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT, ty)
+    //    self.next_binding(wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, ty)
     //}
 
     pub fn next_binding_all(self, ty: wgpu::BindingType) -> Self {
-        self.next_binding(wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT | wgpu::ShaderStage::COMPUTE, ty)
+        self.next_binding(wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE, ty)
     }
 
     pub fn create(self, device: &wgpu::Device, label: &str) -> BindGroupLayoutWithDesc {

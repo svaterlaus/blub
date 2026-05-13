@@ -9,7 +9,7 @@ layout(set = 2, binding = 0) uniform texture3D VelocityVolumeX;
 layout(set = 2, binding = 1) uniform texture3D VelocityVolumeY;
 layout(set = 2, binding = 2) uniform texture3D VelocityVolumeZ;
 layout(set = 2, binding = 3, r8_snorm) uniform restrict image3D MarkerVolume;
-layout(set = 2, binding = 4, r32ui) uniform restrict coherent uimage3D LinkedListDualGrid;
+layout(set = 2, binding = 4, std430) buffer FluidDualGridCells_ { uint Cells[]; } FluidDualGridCells;
 layout(set = 2, binding = 5) buffer restrict ParticlePositionLlBuffer { ParticlePositionLl Particles[]; };
 layout(set = 2, binding = 6) buffer restrict ParticleBufferVx { vec4 ParticleBufferVelocityX[]; };
 layout(set = 2, binding = 7) buffer restrict ParticleBufferVy { vec4 ParticleBufferVelocityY[]; };
@@ -177,7 +177,9 @@ void main() {
         // TODO: Consider not changing, density_projection_gather_error step can do this easily by checking the linkedlist volume
         imageStore(MarkerVolume, ivec3(newPosition), vec4(CELL_FLUID, 0, 0, 0));
         ivec3 nearestDualGridCell = ivec3(newPosition - vec3(0.5));
-        Particles[particleIndex].LinkedListNext = imageAtomicExchange(LinkedListDualGrid, nearestDualGridCell, particleIndex + 1) - 1;
+        Particles[particleIndex].LinkedListNext =
+            atomicExchange(FluidDualGridCells.Cells[fluid_grid_cell_linear_index(nearestDualGridCell)], particleIndex + 1u) -
+            1;
     }
 
     // Write out particle.
